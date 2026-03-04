@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import warnings
 
 import numpy as np
 from sklearn.model_selection import GridSearchCV
@@ -58,6 +59,9 @@ _PARAM_GRIDS = {
 }
 
 _MODEL_NAMES = list(_PARAM_GRIDS)
+_SKLEARN_DELAYED_WARNING_REGEX = (
+    r"`sklearn\.utils\.parallel\.delayed` should be used with"
+)
 
 
 # ── BaselineWrapper ───────────────────────────────────────────────────────────
@@ -103,7 +107,9 @@ class BaselineWrapper:
         elif self.model_name == "random_forest":
             return RandomForestClassifier(
                 random_state=self.random_state,
-                n_jobs=-1,
+                # Let GridSearchCV own process-level parallelism to avoid nested
+                # backend contention and sklearn parallel config warnings.
+                n_jobs=1,
             )
         elif self.model_name == "xgboost":
             try:
@@ -119,7 +125,8 @@ class BaselineWrapper:
                 device=xgb_device,
                 eval_metric="logloss",
                 random_state=self.random_state,
-                n_jobs=-1,
+                # Keep estimator single-threaded inside GridSearchCV workers.
+                n_jobs=1,
                 verbosity=0,
             )
 
@@ -172,7 +179,15 @@ class BaselineWrapper:
             )
         grid = self._build_grid(base, inner_cv)
         try:
-            grid.fit(X_train, y_train)
+            with warnings.catch_warnings():
+                # sklearn>=1.8 may emit this warning from an internal wrapper
+                # when joblib workers execute delayed callables.
+                warnings.filterwarnings(
+                    "ignore",
+                    message=_SKLEARN_DELAYED_WARNING_REGEX,
+                    category=UserWarning,
+                )
+                grid.fit(X_train, y_train)
         except Exception as exc:
             if self.model_name == "xgboost" and xgb_device == "cuda":
                 log.warning(
@@ -183,7 +198,13 @@ class BaselineWrapper:
                 self.runtime_xgb_device = xgb_device
                 base = self._make_base_estimator(xgb_device=xgb_device)
                 grid = self._build_grid(base, inner_cv)
-                grid.fit(X_train, y_train)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=_SKLEARN_DELAYED_WARNING_REGEX,
+                        category=UserWarning,
+                    )
+                    grid.fit(X_train, y_train)
             else:
                 raise
         self._estimator = grid
