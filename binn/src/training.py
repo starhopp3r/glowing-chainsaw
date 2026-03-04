@@ -178,11 +178,11 @@ class BINNTrainer:
         # Guard: empty param lists are not accepted by optimizers.
         if not hidden_2d:
             log.warning("No 2D hidden weights found; using AdamW for all parameters.")
+            # Use a dummy tensor for optimizer_muon so that the unconditional
+            # optimizer_adam assignment below exclusively handles all real params.
+            # Both optimizers share the same zero_grad / step API in the training
+            # loop; the dummy optimizer has no effect on model weights.
             self.optimizer_muon = torch.optim.AdamW(
-                other, lr=self.lr_adam, weight_decay=config.ADAM_WEIGHT_DECAY,
-                betas=config.ADAM_BETAS,
-            )
-            self.optimizer_adam = torch.optim.AdamW(
                 [torch.zeros(1, requires_grad=True)],  # dummy to keep uniform API
                 lr=self.lr_adam,
             )

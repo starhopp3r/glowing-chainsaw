@@ -49,10 +49,21 @@ def _longest_path_depth(dag: nx.DiGraph) -> dict[str, int]:
             preds = list(dag.predecessors(node))
             depth[node] = 0 if not preds else max(depth.get(p, 0) for p in preds) + 1
     except nx.NetworkXUnfeasible:
-        log.warning("Cycle detected in sub-hierarchy; falling back to BFS depth.")
-        for root in (n for n in dag.nodes() if dag.in_degree(n) == 0):
-            for node, d in nx.single_source_shortest_path_length(dag, root).items():
-                depth[node] = max(depth.get(node, 0), d)
+        # Cycle detected — compute longest paths via a condensation DAG.
+        # nx.condensation() collapses each SCC into a single node and returns a
+        # guaranteed DAG, so we can run topological DP on it.
+        log.warning("Cycle detected in sub-hierarchy; using condensation for depth.")
+        cond = nx.condensation(dag)
+        scc_depth: dict[int, int] = {}
+        for scc_node in nx.topological_sort(cond):
+            preds = list(cond.predecessors(scc_node))
+            scc_depth[scc_node] = (
+                0 if not preds else max(scc_depth.get(p, 0) for p in preds) + 1
+            )
+        # Map condensed SCC depth back to original nodes
+        for scc_node, data in cond.nodes(data=True):
+            for orig_node in data["members"]:
+                depth[orig_node] = scc_depth[scc_node]
     return depth
 
 
@@ -621,6 +632,146 @@ def validate_graph(
     return stats
 
 
+# ── PPI Overlay ───────────────────────────────────────────────────────────────
+
+def build_ppi_overlay(
+    fold_genes: list[str],
+    bio_map: dict,
+    connectivity_matrices: list[torch.Tensor],
+    layer_node_names: list[list[str]],
+) -> dict:
+    """
+    Enrich connectivity_matrices[0] with cross-pathway STRING PPI edges and
+    return PPI subgraph metadata for SHAP and visualisation.
+
+    Parameters
+    ----------
+    fold_genes            : genes present in this fold (after MAD filtering)
+    bio_map               : output of build_full_biological_map()
+    connectivity_matrices : list of binary tensors from build_connectivity_matrices()
+                            — C[0] is modified in-place (augmented)
+    layer_node_names      : list[list[str]] from get_layer_node_names()
+
+    Returns
+    -------
+    dict with keys:
+        pathway_ppi_subgraphs   : {pathway_id: {"genes": [...], "ppi_edges": [...]}}
+        cross_pathway_ppi_edges : [{"gene_a", "gene_b", "pathway_a", "pathway_b", "score"}, ...]
+        ppi_edge_to_pathways    : {(gene_a, gene_b): {"score", "shared_pathways", "cross_pathways"}}
+        c0_augmented_count      : int — number of new 1-entries added to C[0]
+    """
+    ppi_edges_list: list = bio_map.get("ppi_edges", [])
+    gene_to_reactome: dict = bio_map.get("gene_to_reactome", {})
+
+    if not layer_node_names or len(layer_node_names) < 2:
+        return {
+            "pathway_ppi_subgraphs": {},
+            "cross_pathway_ppi_edges": [],
+            "ppi_edge_to_pathways": {},
+            "c0_augmented_count": 0,
+        }
+
+    gene_nodes: list[str] = layer_node_names[0]   # layer 0
+    pathway_nodes: list[str] = layer_node_names[1] # layer 1 (leaf pathways)
+
+    gene_set = set(fold_genes)
+    gene_idx: dict[str, int] = {g: i for i, g in enumerate(gene_nodes)}
+    pathway_idx: dict[str, int] = {p: i for i, p in enumerate(pathway_nodes)}
+
+    # Build gene→leaf-pathway map restricted to layer-1 pathways
+    gene_to_leaf: dict[str, set[str]] = {}
+    for gene in gene_nodes:
+        leaves = {p for p in gene_to_reactome.get(gene, set()) if p in pathway_idx}
+        if leaves:
+            gene_to_leaf[gene] = leaves
+
+    # Build leaf-pathway→genes reverse map
+    pathway_to_genes: dict[str, list[str]] = {}
+    for gene, leaves in gene_to_leaf.items():
+        for pid in leaves:
+            pathway_to_genes.setdefault(pid, []).append(gene)
+
+    # Index PPI edges for fast lookup
+    ppi_lookup: dict[tuple[str, str], int] = {}
+    for g1, g2, score in ppi_edges_list:
+        if g1 in gene_set and g2 in gene_set:
+            key = (min(g1, g2), max(g1, g2))
+            ppi_lookup[key] = score
+
+    # ── Step 1: within-pathway PPI subgraphs ─────────────────────────────────
+    pathway_ppi_subgraphs: dict = {}
+    for pid, genes in pathway_to_genes.items():
+        gene_set_p = set(genes)
+        edges = []
+        for i, ga in enumerate(genes):
+            for gb in genes[i + 1:]:
+                key = (min(ga, gb), max(ga, gb))
+                if key in ppi_lookup:
+                    edges.append((ga, gb, ppi_lookup[key]))
+        pathway_ppi_subgraphs[pid] = {"genes": genes, "ppi_edges": edges}
+
+    # ── Step 2: cross-pathway PPI edges ──────────────────────────────────────
+    cross_pathway_ppi_edges: list[dict] = []
+    ppi_edge_to_pathways: dict[tuple, dict] = {}
+
+    for (ga, gb), score in ppi_lookup.items():
+        leaves_a = gene_to_leaf.get(ga, set())
+        leaves_b = gene_to_leaf.get(gb, set())
+
+        shared = sorted(leaves_a & leaves_b)
+        cross = [
+            (pa, pb)
+            for pa in sorted(leaves_a)
+            for pb in sorted(leaves_b)
+            if pa != pb
+        ]
+
+        ppi_edge_to_pathways[(ga, gb)] = {
+            "score": score,
+            "shared_pathways": shared,
+            "cross_pathways": cross,
+        }
+
+        for pa, pb in cross:
+            cross_pathway_ppi_edges.append({
+                "gene_a": ga, "gene_b": gb,
+                "pathway_a": pa, "pathway_b": pb,
+                "score": score,
+            })
+
+    # ── Step 3: augment C^(0) with cross-pathway connections ─────────────────
+    c0_augmented_count = 0
+    if connectivity_matrices:
+        C0 = connectivity_matrices[0]  # (n_genes, n_leaf_pathways)
+        for (ga, gb), info in ppi_edge_to_pathways.items():
+            for pa, pb in info["cross_pathways"]:
+                # gene_a → pathway_b (cross-pathway)
+                if ga in gene_idx and pb in pathway_idx:
+                    ri, ci = gene_idx[ga], pathway_idx[pb]
+                    if ri < C0.shape[0] and ci < C0.shape[1] and C0[ri, ci] == 0:
+                        C0[ri, ci] = 1.0
+                        c0_augmented_count += 1
+                # gene_b → pathway_a (cross-pathway)
+                if gb in gene_idx and pa in pathway_idx:
+                    ri, ci = gene_idx[gb], pathway_idx[pa]
+                    if ri < C0.shape[0] and ci < C0.shape[1] and C0[ri, ci] == 0:
+                        C0[ri, ci] = 1.0
+                        c0_augmented_count += 1
+
+    log.info(
+        f"PPI overlay: {len(pathway_ppi_subgraphs)} pathway subgraphs, "
+        f"{len(cross_pathway_ppi_edges)} cross-pathway edges, "
+        f"{c0_augmented_count} new entries in C^(0)."
+    )
+
+    return {
+        "pathway_ppi_subgraphs": pathway_ppi_subgraphs,
+        "cross_pathway_ppi_edges": cross_pathway_ppi_edges,
+        "ppi_edge_to_pathways": ppi_edge_to_pathways,
+        "c0_augmented_count": c0_augmented_count,
+    }
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def build_fold_network(fold_genes: list[str], bio_map: dict) -> dict:
@@ -655,6 +806,11 @@ def build_fold_network(fold_genes: list[str], bio_map: dict) -> dict:
     node_metadata = build_node_metadata(graph, bio_map)
     stats = validate_graph(graph, connectivity_matrices)
 
+    # PPI overlay — enriches C^(0) and returns metadata for SHAP/visualisation
+    ppi_overlay = build_ppi_overlay(
+        fold_genes, bio_map, connectivity_matrices, layer_node_names
+    )
+
     return {
         "connectivity_matrices": connectivity_matrices,
         "layer_node_names": layer_node_names,
@@ -663,6 +819,7 @@ def build_fold_network(fold_genes: list[str], bio_map: dict) -> dict:
         "stats": stats,
         "n_layers": stats["n_layers"],
         "layer_sizes": stats["layer_sizes"],
+        "ppi_overlay": ppi_overlay,
     }
 
 

@@ -120,6 +120,139 @@ def _trunc(s: str, n: int = 45) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+# ── Geometry helpers ───────────────────────────────────────────────────────────
+
+def _normalise_pos(
+    pos: dict[str, tuple[float, float]],
+    pad: float = 0.08,
+) -> dict[str, tuple[float, float]]:
+    """Normalise arbitrary node coordinates into [pad, 1-pad]^2."""
+    if not pos:
+        return {}
+    xs = np.array([p[0] for p in pos.values()], dtype=float)
+    ys = np.array([p[1] for p in pos.values()], dtype=float)
+    x_min, x_max = float(xs.min()), float(xs.max())
+    y_min, y_max = float(ys.min()), float(ys.max())
+    x_rng = max(x_max - x_min, 1e-9)
+    y_rng = max(y_max - y_min, 1e-9)
+    out: dict[str, tuple[float, float]] = {}
+    for node, (x, y) in pos.items():
+        xn = pad + (1 - 2 * pad) * ((float(x) - x_min) / x_rng)
+        yn = pad + (1 - 2 * pad) * ((float(y) - y_min) / y_rng)
+        out[node] = (xn, yn)
+    return out
+
+
+def _resolve_node_overlaps(
+    pos: dict[str, tuple[float, float]],
+    radii: dict[str, float],
+    bounds: tuple[float, float, float, float],
+    *,
+    gap: float = 0.001,
+    iterations: int = 400,
+    anchor_strength: float = 0.05,
+) -> dict[str, tuple[float, float]]:
+    """
+    Iteratively separate circular nodes until they no longer overlap.
+    Bounds are `(x_min, x_max, y_min, y_max)` in the same coordinate system.
+    """
+    if len(pos) <= 1:
+        return dict(pos)
+
+    nodes = list(pos.keys())
+    arr = np.array([pos[n] for n in nodes], dtype=float)
+    anchor = arr.copy()
+    rad = np.array([max(float(radii.get(n, 0.0)), 1e-9) for n in nodes], dtype=float)
+
+    x_min, x_max, y_min, y_max = bounds
+    for _ in range(max(iterations, 1)):
+        total_push = 0.0
+        for i in range(len(nodes)):
+            for j in range(i + 1, len(nodes)):
+                dx = arr[j, 0] - arr[i, 0]
+                dy = arr[j, 1] - arr[i, 1]
+                dist = float(np.hypot(dx, dy))
+                min_dist = float(rad[i] + rad[j] + gap)
+                if dist >= min_dist:
+                    continue
+                if dist < 1e-9:
+                    theta = ((i * 137 + j * 91) % 360) * np.pi / 180.0
+                    ux, uy = float(np.cos(theta)), float(np.sin(theta))
+                else:
+                    ux, uy = dx / dist, dy / dist
+                shift = 0.5 * (min_dist - dist)
+                arr[i, 0] -= ux * shift
+                arr[i, 1] -= uy * shift
+                arr[j, 0] += ux * shift
+                arr[j, 1] += uy * shift
+                total_push += shift
+
+        # Keep close to original layout while preserving separation.
+        arr += (anchor - arr) * anchor_strength
+
+        # Clamp inside bounds while respecting node radius.
+        for k in range(len(nodes)):
+            rk = rad[k]
+            arr[k, 0] = float(np.clip(arr[k, 0], x_min + rk, x_max - rk))
+            arr[k, 1] = float(np.clip(arr[k, 1], y_min + rk, y_max - rk))
+
+        if total_push < 1e-8:
+            break
+
+    return {n: (float(arr[i, 0]), float(arr[i, 1])) for i, n in enumerate(nodes)}
+
+
+def _count_node_overlaps(
+    pos: dict[str, tuple[float, float]],
+    radii: dict[str, float],
+    *,
+    gap: float = 0.0,
+) -> int:
+    """Return number of overlapping node pairs."""
+    nodes = list(pos.keys())
+    n_overlaps = 0
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            ni, nj = nodes[i], nodes[j]
+            xi, yi = pos[ni]
+            xj, yj = pos[nj]
+            d = float(np.hypot(xj - xi, yj - yi))
+            min_d = float(radii.get(ni, 0.0) + radii.get(nj, 0.0) + gap)
+            if d < min_d:
+                n_overlaps += 1
+    return n_overlaps
+
+
+def _resolve_ppi_schema(
+    ppi_df: pd.DataFrame,
+) -> tuple[str, str, str, str | None, str | None]:
+    """
+    Return `(gene_a_col, gene_b_col, additive_col, shap_a_col, shap_b_col)`.
+    Raises ValueError if required columns are missing.
+    """
+    if {"gene_1", "gene_2"}.issubset(ppi_df.columns):
+        g1_col, g2_col = "gene_1", "gene_2"
+    elif {"gene_a", "gene_b"}.issubset(ppi_df.columns):
+        g1_col, g2_col = "gene_a", "gene_b"
+    else:
+        raise ValueError("PPI DataFrame missing gene endpoint columns")
+
+    if "ppi_importance_add" in ppi_df.columns:
+        imp_col = "ppi_importance_add"
+    elif "additive" in ppi_df.columns:
+        imp_col = "additive"
+    else:
+        raise ValueError("PPI DataFrame missing additive importance column")
+
+    if {"shap_gene_1", "shap_gene_2"}.issubset(ppi_df.columns):
+        s1_col, s2_col = "shap_gene_1", "shap_gene_2"
+    elif {"shap_a", "shap_b"}.issubset(ppi_df.columns):
+        s1_col, s2_col = "shap_a", "shap_b"
+    else:
+        s1_col = s2_col = None
+    return g1_col, g2_col, imp_col, s1_col, s2_col
+
+
 # ── Curve helpers ──────────────────────────────────────────────────────────────
 
 def _interp(x_raw, y_raw, grid):
@@ -166,6 +299,10 @@ def _curve_figure_2pan(
     """
     Generic 2-panel curve figure (left: BINN per-fold, right: model comparison).
     """
+    if not all_fold_metrics:
+        log.warning("No fold metrics available — skipping curve plot.")
+        return
+
     fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(14, 6), sharey=False)
 
     binn_metrics = _fold_metrics_for(all_fold_metrics, "binn")
@@ -191,7 +328,9 @@ def _curve_figure_2pan(
     ax_l.set_xlabel(xlabel); ax_l.set_ylabel(ylabel)
     ax_l.set_xlim(0, 1);     ax_l.set_ylim(0, 1)
     ax_l.set_title(title_left)
-    ax_l.legend(loc="lower right" if not invert_x else "lower left")
+    handles_l, _ = ax_l.get_legend_handles_labels()
+    if handles_l:
+        ax_l.legend(loc="lower right" if not invert_x else "lower left")
     ax_l.grid(alpha=0.2)
     if invert_x:
         ax_l.invert_xaxis()
@@ -219,7 +358,9 @@ def _curve_figure_2pan(
     ax_r.set_xlabel(xlabel); ax_r.set_ylabel(ylabel)
     ax_r.set_xlim(0, 1);     ax_r.set_ylim(0, 1)
     ax_r.set_title(title_right)
-    ax_r.legend(loc="lower right" if not invert_x else "lower left", fontsize=9)
+    handles_r, _ = ax_r.get_legend_handles_labels()
+    if handles_r:
+        ax_r.legend(loc="lower right" if not invert_x else "lower left", fontsize=9)
     ax_r.grid(alpha=0.2)
     if invert_x:
         ax_r.invert_xaxis()
@@ -311,8 +452,14 @@ def plot_confusion_matrices(
     all_fold_metrics: list[dict],
     save_path: str | None = None,
 ) -> None:
+    if not all_fold_metrics:
+        log.warning("No fold metrics available — skipping confusion matrices.")
+        return
     models = [m for m in MODEL_ORDER if any(x["model"] == m for x in all_fold_metrics)]
     n = len(models)
+    if n == 0:
+        log.warning("No known models found in metrics — skipping confusion matrices.")
+        return
     fig, axes = plt.subplots(1, n, figsize=(3.2 * n, 4.5))
     if n == 1:
         axes = [axes]
@@ -363,10 +510,23 @@ def plot_shap_beeswarm(
     top_n: int = 30,
     save_path: str | None = None,
 ) -> None:
+    if shap_values is None:
+        log.warning("SHAP values missing — skipping beeswarm plot.")
+        return
+    shap_values = np.asarray(shap_values)
+    if shap_values.ndim != 2 or shap_values.size == 0:
+        log.warning("SHAP values must be a non-empty 2D array — skipping beeswarm plot.")
+        return
+    _, n_features = shap_values.shape
+    if n_features == 0:
+        log.warning("SHAP values have zero features — skipping beeswarm plot.")
+        return
     mean_abs = np.abs(shap_values).mean(0)
+    top_n = max(1, min(top_n, n_features))
     top_idx  = np.argsort(mean_abs)[::-1][:top_n]
     # Bottom of chart = most important
     plot_order = top_idx[::-1]
+    X_test_arr = np.asarray(X_test) if X_test is not None else None
 
     fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.35 + 2)))
     rng = np.random.default_rng(0)
@@ -376,8 +536,8 @@ def plot_shap_beeswarm(
         jitter = rng.uniform(-0.28, 0.28, len(sv))
         y = rank + jitter
 
-        if X_test is not None:
-            fv = X_test[:, gi]
+        if X_test_arr is not None and X_test_arr.ndim == 2 and X_test_arr.shape[1] > gi:
+            fv = X_test_arr[:, gi]
             mn, mx = fv.min(), fv.max()
             norm = (fv - mn) / (mx - mn + 1e-9)
             c = SHAP_CMAP(norm)
@@ -387,8 +547,14 @@ def plot_shap_beeswarm(
         ax.scatter(sv, y, c=c, s=14, alpha=0.75, zorder=5, linewidths=0)
 
     ax.axvline(0, color="black", lw=0.9, ls="--", alpha=0.6)
-    ax.set_yticks(range(top_n))
-    ax.set_yticklabels([gene_names[i] for i in plot_order], fontsize=10)
+    ax.set_yticks(range(len(plot_order)))
+    labels = []
+    for i in plot_order:
+        if 0 <= i < len(gene_names):
+            labels.append(gene_names[i])
+        else:
+            labels.append(f"feature_{i}")
+    ax.set_yticklabels(labels, fontsize=10)
     ax.set_xlabel("SHAP Value (impact on model output)")
     ax.set_title("Gene Contributions to HPV Status Prediction")
     ax.grid(axis="x", alpha=0.2)
@@ -415,8 +581,17 @@ def plot_shap_bar(
     save_path: str | None = None,
 ) -> None:
     """Horizontal bar chart of gene importance with cross-fold std error bars."""
+    if gene_shap_df is None or gene_shap_df.empty:
+        log.warning("Gene SHAP DataFrame is empty — skipping SHAP bar plot.")
+        return
+    if "mean_abs_shap" not in gene_shap_df.columns:
+        log.warning("Gene SHAP DataFrame missing 'mean_abs_shap' — skipping SHAP bar plot.")
+        return
     df = gene_shap_df.sort_values("mean_abs_shap", ascending=False).head(top_n).iloc[::-1]
     n = len(df)
+    if n == 0:
+        log.warning("No SHAP rows available after filtering — skipping SHAP bar plot.")
+        return
 
     fig, ax = plt.subplots(figsize=(9, max(5, n * 0.33 + 2)))
 
@@ -459,6 +634,12 @@ def plot_pathway_importance(
     top_n: int = 25,
     save_path: str | None = None,
 ) -> None:
+    if pathway_df is None or pathway_df.empty:
+        log.warning("Pathway DataFrame is empty — skipping plot.")
+        return
+    if "mean_abs_shap" not in pathway_df.columns:
+        log.warning("Pathway DataFrame missing 'mean_abs_shap' — skipping plot.")
+        return
     df = pathway_df.sort_values("mean_abs_shap", ascending=False).head(top_n).iloc[::-1]
     n = len(df)
     if n == 0:
@@ -511,18 +692,21 @@ def plot_ppi_importance(
         log.warning("PPI DataFrame is empty — skipping plot.")
         return
 
-    if "ppi_importance_add" not in ppi_df.columns:
-        log.warning("PPI DataFrame missing 'ppi_importance_add' — skipping plot.")
+    try:
+        g1_col, g2_col, imp_col, s1_col, s2_col = _resolve_ppi_schema(ppi_df)
+    except ValueError as exc:
+        log.warning("%s — skipping plot.", exc)
         return
-    df = ppi_df.sort_values("ppi_importance_add", ascending=False).head(top_n)
-    has_gene_shap = {"shap_gene_1", "shap_gene_2"}.issubset(df.columns)
+
+    df = ppi_df.sort_values(imp_col, ascending=False).head(top_n)
+    has_gene_shap = s1_col is not None and s2_col is not None
 
     G = nx.Graph()
     for _, row in df.iterrows():
-        g1, g2 = row["gene_1"], row["gene_2"]
-        edge_w = _safe_num(row.get("ppi_importance_add"), 0.0)
-        s1 = _safe_num(row.get("shap_gene_1"), edge_w / 2.0) if has_gene_shap else edge_w / 2.0
-        s2 = _safe_num(row.get("shap_gene_2"), edge_w / 2.0) if has_gene_shap else edge_w / 2.0
+        g1, g2 = row[g1_col], row[g2_col]
+        edge_w = _safe_num(row.get(imp_col), 0.0)
+        s1 = _safe_num(row.get(s1_col), edge_w / 2.0) if has_gene_shap else edge_w / 2.0
+        s2 = _safe_num(row.get(s2_col), edge_w / 2.0) if has_gene_shap else edge_w / 2.0
 
         if g1 not in G:
             G.add_node(g1, shap=0.0)
@@ -535,39 +719,79 @@ def plot_ppi_importance(
     if G.number_of_nodes() == 0:
         return
 
+    # ── Collision-free node layout ───────────────────────────────────────────
     try:
-        pos = nx.kamada_kawai_layout(G)
+        base_pos = nx.kamada_kawai_layout(G, weight="weight")
     except Exception:
-        pos = nx.spring_layout(G, seed=42, k=1.5)
+        base_pos = nx.spring_layout(G, seed=42, k=1.2, iterations=300, weight="weight")
+    pos = _normalise_pos(base_pos, pad=0.10)
+
+    node_list = list(G.nodes())
+    shap_vals = np.array([_safe_num(G.nodes[n].get("shap"), 0.0) for n in node_list], dtype=float)
+    sv_abs = np.abs(shap_vals)
+    sv_norm = sv_abs / (sv_abs.max() + 1e-9)
+    radii = {
+        n: float(0.020 + 0.022 * sv_norm[i]) for i, n in enumerate(node_list)
+    }
+    pos = _resolve_node_overlaps(
+        pos,
+        radii,
+        bounds=(0.03, 0.97, 0.05, 0.95),
+        gap=0.004,
+        iterations=700,
+        anchor_strength=0.03,
+    )
 
     fig, ax = plt.subplots(figsize=(11, 9))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
 
     edges = list(G.edges(data=True))
     if edges:
-        edge_weights = np.array([d["weight"] for _, _, d in edges])
+        edge_weights = np.array([_safe_num(d.get("weight"), 0.0) for _, _, d in edges], dtype=float)
         ew_norm = (edge_weights - edge_weights.min()) / (edge_weights.max() - edge_weights.min() + 1e-9)
         for (u, v, d), en in zip(edges, ew_norm):
-            nx.draw_networkx_edges(
-                G, pos, edgelist=[(u, v)], ax=ax,
-                width=1.0 + 5.0 * en, alpha=0.35 + 0.45 * en,
-                edge_color="#555555",
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            ax.plot(
+                [x0, x1], [y0, y1],
+                color="#555555",
+                linewidth=0.8 + 3.8 * float(en),
+                alpha=0.30 + 0.45 * float(en),
+                zorder=1,
             )
 
-    shap_vals = np.array([G.nodes[n].get("shap", 0) for n in G.nodes()])
-    sv_abs = np.abs(shap_vals)
-    node_sizes = 300 + 1500 * (sv_abs / (sv_abs.max() + 1e-9))
-    node_colors = SHAP_CMAP((shap_vals - shap_vals.min()) / (shap_vals.max() - shap_vals.min() + 1e-9))
-
-    nx.draw_networkx_nodes(G, pos, ax=ax,
-                           node_size=node_sizes, node_color=node_colors,
-                           edgecolors="#333333", linewidths=0.8, alpha=0.9)
-    nx.draw_networkx_labels(G, pos, ax=ax, font_size=9, font_color="#111111")
+    node_colors = SHAP_CMAP(
+        (shap_vals - shap_vals.min()) / (shap_vals.max() - shap_vals.min() + 1e-9)
+    )
+    for i, n in enumerate(node_list):
+        x, y = pos[n]
+        r = radii[n]
+        circ = mpatches.Circle(
+            (x, y), r,
+            facecolor=node_colors[i],
+            edgecolor="#333333",
+            linewidth=0.9,
+            alpha=0.95,
+            zorder=3,
+        )
+        ax.add_patch(circ)
+        ax.text(
+            x, y,
+            str(n),
+            fontsize=8,
+            ha="center",
+            va="center",
+            color="#111111",
+            zorder=4,
+            clip_on=True,
+        )
 
     sm = plt.cm.ScalarMappable(cmap=SHAP_CMAP,
                                norm=Normalize(shap_vals.min(), shap_vals.max()))
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
-    cbar.set_label("Mean |SHAP| (gene contribution)", fontsize=10)
+    cbar.set_label("Gene contribution score", fontsize=10)
 
     ax.set_title("Protein-Protein Interaction Network\n"
                  "(node size & color = SHAP importance, edge width = PPI score)",
@@ -580,303 +804,168 @@ def plot_ppi_importance(
         plt.show()
 
 
-# ── 9. Biological Cascade ─────────────────────────────────────────────────────
-
-_DARK_BG   = "#0D1117"
-_DARK_TEXT = "#E6EDF3"
-_LIGHT_BG  = "white"
-_LIGHT_TEXT = "#1a1a2a"
-
-# SHAP → color for cascade nodes
-_SHAP_POS  = "#D6604D"   # positive → HPV+
-_SHAP_NEG  = "#4393C3"   # negative → HPV-
-_PATHWAY_COLORS = ["#3A86FF", "#8338EC", "#FB5607", "#FF006E", "#06D6A0", "#FFBE0B"]
-
-
-def _shap_to_color(shap_val: float, vmax: float = 1.0, dark: bool = False) -> str:
-    t = 0.5 + 0.5 * np.clip(shap_val / (vmax + 1e-9), -1, 1)
-    rgba = SHAP_CMAP(t)
-    return mpl.colors.to_hex(rgba)
-
-
-def _bezier_band(ax, x0, y0_c, h0, x1, y1_c, h1,
-                 color="#888888", alpha=0.25, zorder=1):
-    """Draw a smooth filled bezier band connecting two rectangular nodes."""
-    t = np.linspace(0, 1, 80)
-    xm = (x0 + x1) / 2
-
-    def _bezier_y(ya, yb):
-        # Cubic bezier: horizontal tangents at both endpoints
-        return (1-t)**3*ya + 3*(1-t)**2*t*ya + 3*(1-t)*t**2*yb + t**3*yb
-
-    y_top = _bezier_y(y0_c + h0/2, y1_c + h1/2)
-    y_bot = _bezier_y(y0_c - h0/2, y1_c - h1/2)
-    x_vals = xm * (3*(1-t)**2*t + 3*(1-t)*t**2) * 2 + (1-t)**3*x0 + t**3*x1
-
-    poly_x = np.concatenate([x_vals, x_vals[::-1]])
-    poly_y = np.concatenate([y_top, y_bot[::-1]])
-    ax.fill(poly_x, poly_y, color=color, alpha=alpha, zorder=zorder,
-            linewidth=0, antialiased=True)
-
-
-def _layout_layer(items: list[dict], attr_key: str, x_pos: float,
-                  fig_h: float = 10.0, pad: float = 0.6,
-                  min_h: float = 0.25, max_h: float = 1.8) -> list[dict]:
-    """Place nodes vertically for a cascade layer, sized by attr_key."""
-    if not items:
-        return []
-    attrs = [max(item.get(attr_key, 0), 1e-6) for item in items]
-    total = sum(attrs)
-    avail = fig_h - 2*pad - max(0, len(items)-1) * 0.15
-    nodes = []
-    y = fig_h - pad
-    for item, attr in zip(items, attrs):
-        h = float(np.clip(avail * attr / total, min_h, max_h))
-        y -= h
-        nodes.append({"item": item, "x": x_pos, "y_c": y + h/2, "h": h, "attr": attr})
-        y -= 0.15
-    return nodes
-
-
-def _draw_node(ax, x, y_c, h, w, label: str, color: str,
-               text_color: str, dark: bool, fontsize: int = 8):
-    """Draw a rounded rectangle node with label."""
-    fancy = mpatches.FancyBboxPatch(
-        (x - w/2, y_c - h/2), w, h,
-        boxstyle="round,pad=0.04",
-        facecolor=color, edgecolor=text_color,
-        linewidth=0.6, alpha=0.9, zorder=5,
-    )
-    if dark:
-        fancy.set_path_effects([
-            pe.Stroke(linewidth=3, foreground=color, alpha=0.4),
-            pe.Normal(),
-        ])
-    ax.add_patch(fancy)
-    ax.text(x, y_c, _trunc(label, 30), ha="center", va="center",
-            fontsize=fontsize, color=text_color, fontweight="medium",
-            zorder=6, wrap=False, clip_on=True)
-
-
-def _draw_cascade_panel(
-    ax,
-    gene_nodes: list[dict],
-    leaf_nodes:  list[dict],
-    inter_nodes: list[dict],
-    root_nodes:  list[dict],
-    output_node: dict,
-    cascade_edges: list[tuple],
-    dark: bool,
-    node_w: float = 1.3,
-) -> None:
-    bg     = _DARK_BG   if dark else _LIGHT_BG
-    txt_c  = _DARK_TEXT if dark else _LIGHT_TEXT
-    ax.set_facecolor(bg)
-    ax.figure.set_facecolor(bg)
-
-    # Layer x positions
-    layer_x = {
-        "gene":   gene_nodes[0]["x"]  if gene_nodes  else 1.5,
-        "leaf":   leaf_nodes[0]["x"]  if leaf_nodes  else 4.5,
-        "inter":  inter_nodes[0]["x"] if inter_nodes else 8.0,
-        "root":   root_nodes[0]["x"]  if root_nodes  else 11.5,
-        "output": output_node["x"],
-    }
-
-    # Build edge lookup: (src_label, dst_label) → weight
-    edge_w: dict[tuple, float] = {}
-    if cascade_edges:
-        for src, dst, wt in cascade_edges:
-            edge_w[(str(src), str(dst))] = max(edge_w.get((str(src), str(dst)), 0), float(wt))
-
-    def _find_node(label, layer):
-        for n in layer:
-            if n["item"].get("id", n["item"].get("gene", "")) == label or \
-               n["item"].get("name", "") == label or \
-               n["item"].get("gene", "") == label:
-                return n
-        return None
-
-    # ── Draw connections (bezier bands) ──────────────────────────────────────
-    max_attr = max([n["attr"] for n in gene_nodes + leaf_nodes + inter_nodes + root_nodes], default=1)
-
-    def _connect_layers(src_layer, dst_layer, color_base="#888888"):
-        for src_n in src_layer:
-            for dst_n in dst_layer:
-                sk = src_n["item"].get("id", src_n["item"].get("gene", ""))
-                dk = dst_n["item"].get("id", dst_n["item"].get("gene", ""))
-                wt = edge_w.get((sk, dk), edge_w.get((dk, sk), 0))
-                if wt < 1e-9:
-                    continue
-                alpha = float(np.clip(0.10 + 0.50 * wt / max_attr, 0.05, 0.55))
-                h_src = src_n["h"] * (wt / (src_n["attr"] + 1e-9))
-                h_dst = dst_n["h"] * (wt / (dst_n["attr"] + 1e-9))
-                _bezier_band(
-                    ax,
-                    src_n["x"] + node_w/2, src_n["y_c"], np.clip(h_src, 0.05, src_n["h"]),
-                    dst_n["x"] - node_w/2, dst_n["y_c"], np.clip(h_dst, 0.05, dst_n["h"]),
-                    color=color_base, alpha=alpha,
-                )
-
-    # Gene → leaf pathway connections
-    _connect_layers(gene_nodes, leaf_nodes, "#4da6ff" if dark else "#90CAF9")
-    _connect_layers(leaf_nodes, inter_nodes, "#7c5cbf" if dark else "#CE93D8")
-    _connect_layers(inter_nodes, root_nodes, "#d68040" if dark else "#FFCC80")
-
-    # Root → output
-    for rn in root_nodes:
-        alpha = float(np.clip(0.15 + 0.45 * rn["attr"] / max_attr, 0.1, 0.55))
-        _bezier_band(
-            ax,
-            rn["x"] + node_w/2, rn["y_c"], rn["h"] * 0.5,
-            output_node["x"] - node_w/2, output_node["y_c"], output_node["h"] * 0.5,
-            color="#F18F01" if dark else "#FF8F00",
-            alpha=alpha,
-        )
-
-    # ── Draw nodes ────────────────────────────────────────────────────────────
-    shap_vals = [n["item"].get("shap", 0) for n in gene_nodes]
-    vmax = max(abs(v) for v in shap_vals) if shap_vals else 1.0
-
-    for n in gene_nodes:
-        label = n["item"].get("gene", "?")
-        shap  = n["item"].get("shap", 0)
-        col   = _shap_to_color(shap, vmax, dark)
-        _draw_node(ax, n["x"], n["y_c"], n["h"], node_w, label, col, txt_c, dark, fontsize=8)
-
-    pw_palette = _PATHWAY_COLORS if dark else ["#1565C0","#283593","#311B92","#1A237E","#006064","#004D40"]
-    for i, n in enumerate(leaf_nodes):
-        label = _trunc(n["item"].get("name", "?"), 28)
-        col   = pw_palette[i % len(pw_palette)]
-        _draw_node(ax, n["x"], n["y_c"], n["h"], node_w + 0.4, label, col, txt_c, dark, fontsize=7)
-
-    for i, n in enumerate(inter_nodes):
-        label = _trunc(n["item"].get("name", "?"), 28)
-        col   = pw_palette[(i + 2) % len(pw_palette)]
-        _draw_node(ax, n["x"], n["y_c"], n["h"], node_w + 0.4, label, col, txt_c, dark, fontsize=7)
-
-    for i, n in enumerate(root_nodes):
-        label = _trunc(n["item"].get("name", "?"), 28)
-        col   = pw_palette[(i + 4) % len(pw_palette)]
-        _draw_node(ax, n["x"], n["y_c"], n["h"], node_w + 0.4, label, col, txt_c, dark, fontsize=8)
-
-    out_col = "#F18F01" if dark else "#E65100"
-    _draw_node(ax, output_node["x"], output_node["y_c"],
-               output_node["h"], node_w + 0.4,
-               "HPV+/HPV−\nPrediction", out_col, "white" if dark else "white", dark, fontsize=9)
-
-    # ── Layer labels ──────────────────────────────────────────────────────────
-    fig_h = ax.get_ylim()[1]
-    label_y = fig_h + 0.3
-    for label, x in [("Genes", layer_x["gene"]), ("Leaf\nPathways", layer_x["leaf"]),
-                     ("Intermediate\nPathways", layer_x["inter"]),
-                     ("Root\nPathways", layer_x["root"]), ("Output", layer_x["output"])]:
-        ax.text(x, label_y, label, ha="center", va="bottom", fontsize=10,
-                fontweight="bold", color=txt_c, zorder=7)
-
-    ax.set_xlim(layer_x["gene"] - node_w, layer_x["output"] + node_w)
-    ax.set_ylim(-0.5, fig_h + 1.2)
-    ax.axis("off")
-
-
-def plot_biological_cascade(
-    cascade: dict,
-    bio_map: dict | None = None,
+def plot_full_ppi_map(
+    ppi_df: pd.DataFrame,
     save_path: str | None = None,
 ) -> None:
     """
-    Two-version biological cascade figure (dark + light).
-
-    Reads from cascade dict produced by reconstruct_hpv_cascade().
+    Exhaustive companion view: draw the full PPI table (all edges) with a
+    collision-resolved node layout.
     """
-    top_genes = cascade.get("top_genes", [])[:15]
-    top_leaf   = cascade.get("top_leaf_pathways", [])[:10]
-    top_inter  = cascade.get("top_intermediate_pathways", [])[:8]
-    top_root   = cascade.get("top_root_pathways", [])[:6]
-    edges      = cascade.get("cascade_edges", [])
-
-    if not top_genes:
-        log.warning("Cascade has no gene data — skipping cascade plot.")
+    if ppi_df is None or ppi_df.empty:
+        log.warning("PPI DataFrame is empty — skipping full PPI map.")
         return
 
-    FIG_H = 11.0
-    X_GENE  = 1.5
-    X_LEAF  = 4.8
-    X_INTER = 8.2
-    X_ROOT  = 11.6
-    X_OUT   = 14.5
+    try:
+        g1_col, g2_col, imp_col, s1_col, s2_col = _resolve_ppi_schema(ppi_df)
+    except ValueError as exc:
+        log.warning("%s — skipping full PPI map.", exc)
+        return
 
-    gene_nodes  = _layout_layer(top_genes, "shap", X_GENE, FIG_H)
-    leaf_nodes  = _layout_layer(top_leaf,  "attribution", X_LEAF, FIG_H)
-    inter_nodes = _layout_layer(top_inter, "attribution", X_INTER, FIG_H)
-    root_nodes  = _layout_layer(top_root,  "attribution", X_ROOT, FIG_H)
-    output_node = {"x": X_OUT, "y_c": FIG_H/2, "h": 1.5, "attr": 1.0,
-                   "item": {"name": "HPV+/HPV−"}}
-
-    for dark, tag in [(True, "dark"), (False, "light")]:
-        fig, ax = plt.subplots(figsize=(18, 11))
-        ax.set_xlim(0, 16)
-        ax.set_ylim(-0.5, FIG_H + 1.5)
-
-        _draw_cascade_panel(
-            ax, gene_nodes, leaf_nodes, inter_nodes, root_nodes, output_node,
-            edges, dark=dark,
-        )
-
-        title_col = _DARK_TEXT if dark else _LIGHT_TEXT
-        ax.set_title(
-            "Biological Cascade: HPV-Driven HNSCC Proliferation Pathways Revealed by BINN",
-            fontsize=13, pad=14, color=title_col, fontweight="bold",
-        )
-
-        # SHAP color bar legend
-        sm = plt.cm.ScalarMappable(cmap=SHAP_CMAP, norm=Normalize(-1, 1))
-        sm.set_array([])
-        cbar = plt.colorbar(sm, ax=ax, orientation="horizontal",
-                            fraction=0.025, pad=0.01, aspect=40,
-                            location="bottom")
-        cbar.set_label("Gene SHAP Value (← HPV−  |  HPV+ →)", fontsize=9,
-                       color=title_col)
-        cbar.ax.tick_params(colors=title_col, labelsize=8)
-
-        fig.patch.set_facecolor(_DARK_BG if dark else _LIGHT_BG)
-        fig.tight_layout(rect=[0, 0.04, 1, 0.97])
-
-        sp = save_path or os.path.join(config.FIGURE_DIR, "biological_cascade")
-        base = sp.replace("biological_cascade", f"biological_cascade_{tag}")
-        if save_path:
-            _save_fig(fig, base)
+    G = nx.Graph()
+    for row in ppi_df.itertuples(index=False):
+        ra = getattr(row, g1_col)
+        rb = getattr(row, g2_col)
+        ga, gb = str(ra), str(rb)
+        if not ga or not gb or ga == gb:
+            continue
+        w = _safe_num(getattr(row, imp_col), 0.0)
+        if w <= 0:
+            continue
+        sa = _safe_num(getattr(row, s1_col), w / 2.0) if s1_col else w / 2.0
+        sb = _safe_num(getattr(row, s2_col), w / 2.0) if s2_col else w / 2.0
+        if ga not in G:
+            G.add_node(ga, shap=0.0)
+        if gb not in G:
+            G.add_node(gb, shap=0.0)
+        G.nodes[ga]["shap"] = max(_safe_num(G.nodes[ga].get("shap"), 0.0), sa)
+        G.nodes[gb]["shap"] = max(_safe_num(G.nodes[gb].get("shap"), 0.0), sb)
+        if G.has_edge(ga, gb):
+            G[ga][gb]["weight"] = max(_safe_num(G[ga][gb].get("weight"), 0.0), w)
         else:
-            plt.show()
-            plt.close(fig)
+            G.add_edge(ga, gb, weight=w)
+
+    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+        log.warning("No valid PPI edges available — skipping full PPI map.")
+        return
+
+    n_nodes = G.number_of_nodes()
+    try:
+        k = max(0.25, min(2.4, 2.0 / np.sqrt(max(n_nodes, 1))))
+        base_pos = nx.spring_layout(
+            G,
+            seed=42,
+            iterations=450 if n_nodes <= 500 else 250,
+            k=k,
+            weight="weight",
+        )
+    except Exception:
+        base_pos = {n: (np.cos(i), np.sin(i)) for i, n in enumerate(G.nodes())}
+    pos = _normalise_pos(base_pos, pad=0.08)
+
+    node_list = list(G.nodes())
+    shap_vals = np.array([_safe_num(G.nodes[n].get("shap"), 0.0) for n in node_list], dtype=float)
+    sv_abs = np.abs(shap_vals)
+    sv_norm = sv_abs / (sv_abs.max() + 1e-9)
+
+    # Adaptive radii keep dense graphs readable while enforcing no overlaps.
+    base_r = float(np.clip(0.24 / np.sqrt(max(n_nodes, 1)), 0.003, 0.013))
+    radii = {n: float(base_r * (0.85 + 1.15 * sv_norm[i])) for i, n in enumerate(node_list)}
+    pos = _resolve_node_overlaps(
+        pos,
+        radii,
+        bounds=(0.02, 0.98, 0.04, 0.96),
+        gap=max(0.001, base_r * 0.20),
+        iterations=900 if n_nodes <= 350 else 500,
+        anchor_strength=0.02,
+    )
+
+    # If any residual overlaps remain, shrink radii slightly and re-resolve.
+    overlap_gap = max(0.0008, base_r * 0.15)
+    retry = 0
+    while _count_node_overlaps(pos, radii, gap=overlap_gap) > 0 and retry < 5:
+        radii = {k: v * 0.92 for k, v in radii.items()}
+        pos = _resolve_node_overlaps(
+            pos,
+            radii,
+            bounds=(0.02, 0.98, 0.04, 0.96),
+            gap=overlap_gap,
+            iterations=500,
+            anchor_strength=0.02,
+        )
+        retry += 1
+
+    fig, ax = plt.subplots(figsize=(16, 12))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    edges = list(G.edges(data=True))
+    ew = np.array([_safe_num(d.get("weight"), 0.0) for _, _, d in edges], dtype=float)
+    ew_norm = (ew - ew.min()) / (ew.max() - ew.min() + 1e-9)
+    for (u, v, d), en in zip(edges, ew_norm):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        ax.plot(
+            [x0, x1], [y0, y1],
+            color="#546E7A",
+            linewidth=0.18 + 1.75 * float(en),
+            alpha=0.10 + 0.30 * float(en),
+            zorder=1,
+        )
+
+    cvals = SHAP_CMAP((shap_vals - shap_vals.min()) / (shap_vals.max() - shap_vals.min() + 1e-9))
+    for i, n in enumerate(node_list):
+        x, y = pos[n]
+        r = radii[n]
+        ax.add_patch(
+            mpatches.Circle(
+                (x, y),
+                r,
+                facecolor=cvals[i],
+                edgecolor="#1f2937",
+                linewidth=0.35,
+                alpha=0.95,
+                zorder=3,
+            )
+        )
+
+    # Label only top contributors to preserve readability.
+    top_label_n = min(60, n_nodes)
+    rank_nodes = sorted(node_list, key=lambda n: _safe_num(G.nodes[n].get("shap"), 0.0), reverse=True)
+    for n in rank_nodes[:top_label_n]:
+        x, y = pos[n]
+        ax.text(
+            x,
+            y + radii[n] + 0.003,
+            str(n),
+            fontsize=7,
+            ha="center",
+            va="bottom",
+            color="#0f172a",
+            zorder=4,
+            clip_on=True,
+        )
+
+    sm = plt.cm.ScalarMappable(cmap=SHAP_CMAP, norm=Normalize(shap_vals.min(), shap_vals.max()))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, fraction=0.02, pad=0.01)
+    cbar.set_label("Gene contribution score", fontsize=10)
+
+    ax.set_title(
+        f"Full PPI Interaction Map ({G.number_of_nodes()} proteins, "
+        f"{G.number_of_edges()} interactions)",
+        fontsize=13,
+        pad=12,
+    )
+    ax.axis("off")
+    fig.tight_layout()
+    if save_path:
+        _save_fig(fig, save_path)
+    else:
+        plt.show()
 
 
-# ── 9b. Sankey-like Biological Cascade (gene→protein→PPI→pathways→output) ───
-
-_FLOW_LAYER_COLORS_DARK = {
-    "gene": "#7AA2F7",
-    "protein": "#2EC4B6",
-    "ppi": "#FF7F50",
-    "group": "#C77DFF",
-    "leaf": "#4CC9F0",
-    "inter": "#4895EF",
-    "root": "#4361EE",
-    "output": "#F8961E",
-}
-
-_FLOW_LAYER_COLORS_LIGHT = {
-    "gene": "#4F6D9B",
-    "protein": "#2A9D8F",
-    "ppi": "#E76F51",
-    "group": "#9B5DE5",
-    "leaf": "#1D6996",
-    "inter": "#2A6F97",
-    "root": "#184E77",
-    "output": "#BC6C25",
-}
-
-_FLOW_LAYER_ORDER = ["gene", "protein", "ppi", "group", "leaf", "inter", "root", "output"]
-
+# ── 9. Biological Cascade ─────────────────────────────────────────────────────
 
 def _safe_num(x: Any, default: float = 0.0) -> float:
     try:
@@ -885,563 +974,482 @@ def _safe_num(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def _blend_hex(c1: str, c2: str, t: float) -> str:
-    """Linear blend between two hex colors."""
-    t = float(np.clip(t, 0.0, 1.0))
-    a = np.array(mpl.colors.to_rgb(c1), dtype=float)
-    b = np.array(mpl.colors.to_rgb(c2), dtype=float)
-    out = (1.0 - t) * a + t * b
-    return mpl.colors.to_hex(out)
+# Diverging cascade colormap: blue (HPV−) → near-white → red (HPV+)
+_CASCADE_CMAP = LinearSegmentedColormap.from_list(
+    "cascade_div", ["#3B82F6", "#F9FAFB", "#DC2626"], N=256
+)
 
 
-def _contrast_text(hex_color: str, dark: bool) -> str:
-    """Pick readable text color for a filled node color."""
-    r, g, b = mpl.colors.to_rgb(hex_color)
-    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    if dark:
-        return "#EAF2FF" if lum < 0.52 else "#102038"
-    return "#FFFFFF" if lum < 0.45 else "#17253A"
-
-
-def _build_flow_graph_from_cascade(
+def plot_biological_cascade(
     cascade: dict,
-    max_genes: int = 14,
-    max_ppis: int = 24,
-    max_leaf: int = 12,
-    max_inter: int = 6,
-    max_root: int = 8,
-) -> tuple[dict[str, dict], list[dict], list[tuple[str, str, float]]]:
-    """
-    Build a layered flow graph:
-    genes -> proteins -> PPI pairs -> pathway-groups -> leaf -> inter -> root -> output.
-    """
-    top_genes = cascade.get("top_genes", [])[:max_genes]
-    top_ppis = cascade.get("top_ppis", [])[:max_ppis]
-    top_leaf = cascade.get("top_leaf_pathways", [])[:max_leaf]
-    all_inter = cascade.get("top_intermediate_pathways", [])
-    top_root = cascade.get("top_root_pathways", [])[:max_root]
-    cascade_edges = cascade.get("cascade_edges", [])
-    top_inter = list(all_inter[:max_inter])
-
-    # Ensure intermediate pathways directly referenced by cascade edges are retained.
-    inter_rows = {
-        str(p.get("id", "")).strip(): p
-        for p in all_inter
-        if str(p.get("id", "")).strip()
-    }
-    selected_inter_ids = {str(p.get("id", "")).strip() for p in top_inter}
-    for src, dst, _ in cascade_edges:
-        src_id, dst_id = str(src).strip(), str(dst).strip()
-        for iid in (src_id, dst_id):
-            if iid in inter_rows and iid not in selected_inter_ids:
-                top_inter.append(inter_rows[iid])
-                selected_inter_ids.add(iid)
-
-    nodes: dict[str, dict] = {}
-    edges_map: dict[tuple[str, str], float] = {}
-
-    def _add_edge(src: str, dst: str, weight: float) -> None:
-        w = max(float(weight), 0.0)
-        if w <= 0:
-            return
-        edges_map[(src, dst)] = edges_map.get((src, dst), 0.0) + w
-
-    # Genes + proteins
-    for g in top_genes:
-        gene = str(g.get("gene", "")).strip()
-        if not gene:
-            continue
-        shap = _safe_num(g.get("shap"), 0.0)
-        protein = str(g.get("protein") or gene).strip() or gene
-        uniprot = g.get("uniprot")
-
-        gid = f"gene::{gene}"
-        pid = f"protein::{gene}"
-        p_label = protein if not uniprot else f"{protein} ({uniprot})"
-
-        nodes[gid] = {
-            "id": gid,
-            "kind": "gene",
-            "label": gene,
-            "value": max(abs(shap), 1e-9),
-            "shap": shap,
-        }
-        nodes[pid] = {
-            "id": pid,
-            "kind": "protein",
-            "label": _trunc(p_label, 38),
-            "value": max(abs(shap), 1e-9),
-            "gene": gene,
-        }
-        _add_edge(gid, pid, max(abs(shap), 1e-9))
-
-    # Pathway hierarchy nodes
-    leaf_ids = set()
-    inter_ids = set()
-    root_ids = set()
-    name_to_leaf: dict[str, str] = {}
-    name_to_inter: dict[str, str] = {}
-    name_to_root: dict[str, str] = {}
-
-    for p in top_leaf:
-        pid = str(p.get("id", "")).strip()
-        if not pid:
-            continue
-        name = str(p.get("name", pid))
-        leaf_ids.add(pid)
-        name_to_leaf[name] = pid
-        nodes[f"leaf::{pid}"] = {
-            "id": f"leaf::{pid}",
-            "kind": "leaf",
-            "label": _trunc(name, 44),
-            "value": max(_safe_num(p.get("attribution"), 0.0), 1e-9),
-            "pathway_id": pid,
-            "pathway_name": name,
-        }
-
-    for p in top_inter:
-        pid = str(p.get("id", "")).strip()
-        if not pid:
-            continue
-        name = str(p.get("name", pid))
-        inter_ids.add(pid)
-        name_to_inter[name] = pid
-        nodes[f"inter::{pid}"] = {
-            "id": f"inter::{pid}",
-            "kind": "inter",
-            "label": _trunc(name, 44),
-            "value": max(_safe_num(p.get("attribution"), 0.0), 1e-9),
-            "pathway_id": pid,
-            "pathway_name": name,
-        }
-
-    for p in top_root:
-        pid = str(p.get("id", "")).strip()
-        if not pid:
-            continue
-        name = str(p.get("name", pid))
-        root_ids.add(pid)
-        name_to_root[name] = pid
-        nodes[f"root::{pid}"] = {
-            "id": f"root::{pid}",
-            "kind": "root",
-            "label": _trunc(name, 44),
-            "value": max(_safe_num(p.get("attribution"), 0.0), 1e-9),
-            "pathway_id": pid,
-            "pathway_name": name,
-        }
-
-    # PPI pair nodes and pathway-group nodes
-    pathway_group_weights: dict[str, float] = {}
-    for row in top_ppis:
-        g1 = str(row.get("gene1", "")).strip()
-        g2 = str(row.get("gene2", "")).strip()
-        if not g1 or not g2:
-            continue
-        p1 = f"protein::{g1}"
-        p2 = f"protein::{g2}"
-        if p1 not in nodes or p2 not in nodes:
-            continue
-
-        imp_raw = _safe_num(row.get("importance"), 0.0)
-        if imp_raw <= 0:
-            continue
-        imp = max(imp_raw, 1e-9)
-        pair = tuple(sorted((g1, g2)))
-        ppi_id = f"ppi::{pair[0]}::{pair[1]}"
-        if ppi_id not in nodes:
-            nodes[ppi_id] = {
-                "id": ppi_id,
-                "kind": "ppi",
-                "label": _trunc(f"{pair[0]} ↔ {pair[1]}", 36),
-                "value": imp,
-            }
-        else:
-            nodes[ppi_id]["value"] = max(_safe_num(nodes[ppi_id].get("value"), 0.0), imp)
-
-        _add_edge(p1, ppi_id, imp / 2.0)
-        _add_edge(p2, ppi_id, imp / 2.0)
-
-        shared = row.get("shared_pathways", []) or []
-        if not isinstance(shared, list):
-            shared = [str(shared)]
-        group_name = None
-        # Prefer pathways already present in the selected hierarchy layers.
-        for s in shared:
-            s_name = str(s).strip()
-            if s_name in name_to_leaf or s_name in name_to_inter or s_name in name_to_root:
-                group_name = s_name
-                break
-        if group_name is None and shared:
-            group_name = str(shared[0]).strip()
-        if not group_name:
-            group_name = "Unassigned PPI pathway context"
-
-        gid = f"group::{group_name}"
-        if gid not in nodes:
-            nodes[gid] = {
-                "id": gid,
-                "kind": "group",
-                "label": _trunc(group_name, 44),
-                "value": 0.0,
-                "pathway_name": group_name,
-            }
-        nodes[gid]["value"] = _safe_num(nodes[gid]["value"], 0.0) + imp
-        pathway_group_weights[group_name] = pathway_group_weights.get(group_name, 0.0) + imp
-        _add_edge(ppi_id, gid, imp)
-
-    # Connect pathway-group nodes into the hierarchy.
-    fallback_leaf = next(iter(leaf_ids), None)
-    fallback_inter = next(iter(inter_ids), None)
-    for group_name, w in pathway_group_weights.items():
-        gid = f"group::{group_name}"
-        if group_name in name_to_leaf:
-            _add_edge(gid, f"leaf::{name_to_leaf[group_name]}", w)
-        elif group_name in name_to_inter:
-            _add_edge(gid, f"inter::{name_to_inter[group_name]}", w)
-        elif group_name in name_to_root:
-            _add_edge(gid, f"root::{name_to_root[group_name]}", w)
-        elif fallback_leaf is not None:
-            # Keep pathway-group context in-flow even when pathway naming differs.
-            _add_edge(gid, f"leaf::{fallback_leaf}", 0.7 * w)
-        elif fallback_inter is not None:
-            _add_edge(gid, f"inter::{fallback_inter}", 0.7 * w)
-
-    # Add hierarchy edges from stored cascade edges (id-based).
-    for src, dst, wt in cascade_edges:
-        src_id = str(src)
-        dst_id = str(dst)
-        w = max(_safe_num(wt, 0.0), 0.0)
-        if w <= 0:
-            continue
-        if src_id in leaf_ids and dst_id in inter_ids:
-            _add_edge(f"leaf::{src_id}", f"inter::{dst_id}", w)
-        elif src_id in leaf_ids and dst_id in root_ids:
-            _add_edge(f"leaf::{src_id}", f"root::{dst_id}", w)
-        elif src_id in inter_ids and dst_id in root_ids:
-            _add_edge(f"inter::{src_id}", f"root::{dst_id}", w)
-        elif dst_id in leaf_ids:
-            # Stored cascade uses gene -> leaf edges; route via protein layer.
-            prot = f"protein::{src_id}"
-            gene = f"gene::{src_id}"
-            target = f"leaf::{dst_id}"
-            if prot in nodes:
-                _add_edge(prot, target, w)
-            elif gene in nodes:
-                _add_edge(gene, target, w)
-
-    # Ensure hierarchy continuity for display: leaf -> inter/root and inter -> root.
-    best_inter = None
-    best_root = None
-    if inter_ids:
-        best_inter = max(inter_ids, key=lambda i: _safe_num(nodes.get(f"inter::{i}", {}).get("value"), 0.0))
-    if root_ids:
-        best_root = max(root_ids, key=lambda i: _safe_num(nodes.get(f"root::{i}", {}).get("value"), 0.0))
-
-    def _has_out(src: str, prefixes: tuple[str, ...]) -> bool:
-        return any(s == src and any(d.startswith(p) for p in prefixes) for (s, d) in edges_map)
-
-    for lid in leaf_ids:
-        src = f"leaf::{lid}"
-        if _has_out(src, ("inter::", "root::")):
-            continue
-        w = max(_safe_num(nodes.get(src, {}).get("value"), 0.0), 1e-9)
-        if best_inter is not None:
-            _add_edge(src, f"inter::{best_inter}", w)
-        elif best_root is not None:
-            _add_edge(src, f"root::{best_root}", w)
-
-    if best_root is not None:
-        for iid in inter_ids:
-            src = f"inter::{iid}"
-            if _has_out(src, ("root::",)):
-                continue
-            w = max(_safe_num(nodes.get(src, {}).get("value"), 0.0), 1e-9)
-            _add_edge(src, f"root::{best_root}", w)
-
-    # Ensure all roots connect to OUTPUT.
-    out_id = "output::HPV"
-    nodes[out_id] = {
-        "id": out_id,
-        "kind": "output",
-        "label": "HPV+/HPV− Output",
-        "value": 1.0,
-    }
-    for rid in root_ids:
-        src = f"root::{rid}"
-        w = max(_safe_num(nodes[src].get("value"), 0.0), 1e-9)
-        _add_edge(src, out_id, w)
-
-    edges = [(s, d, w) for (s, d), w in edges_map.items() if s in nodes and d in nodes and w > 0]
-    if not edges:
-        return {}, [], []
-
-    # Keep only nodes on at least one directed path to OUTPUT to avoid clutter.
-    flow_graph = nx.DiGraph()
-    for s, d, w in edges:
-        flow_graph.add_edge(s, d, weight=w)
-    if out_id in flow_graph:
-        keep = nx.ancestors(flow_graph, out_id) | {out_id}
-        edges = [(s, d, w) for s, d, w in edges if s in keep and d in keep]
-        nodes = {nid: n for nid, n in nodes.items() if nid in keep}
-
-    if not edges or not nodes:
-        return {}, [], []
-
-    # Refresh node values from in/out flow magnitude (after pruning).
-    in_flow: dict[str, float] = {}
-    out_flow: dict[str, float] = {}
-    for s, d, w in edges:
-        out_flow[s] = out_flow.get(s, 0.0) + w
-        in_flow[d] = in_flow.get(d, 0.0) + w
-    for nid, n in nodes.items():
-        base = _safe_num(n.get("value"), 0.0)
-        n["value"] = max(base, in_flow.get(nid, 0.0), out_flow.get(nid, 0.0), 1e-9)
-
-    layers: list[dict] = []
-    for kind in _FLOW_LAYER_ORDER:
-        layer_nodes = [n for n in nodes.values() if n.get("kind") == kind]
-        layer_nodes.sort(key=lambda x: _safe_num(x.get("value"), 0.0), reverse=True)
-        if layer_nodes:
-            layers.append({"kind": kind, "nodes": layer_nodes})
-
-    return nodes, layers, edges
-
-
-def _draw_sankey_cascade_panel(
-    ax: plt.Axes,
-    nodes: dict[str, dict],
-    layers: list[dict],
-    edges: list[tuple[str, str, float]],
-    dark: bool,
+    gene_shap_df: pd.DataFrame | None = None,
+    pathway_df: pd.DataFrame | None = None,
+    ppi_df: pd.DataFrame | None = None,
+    p2p_df: pd.DataFrame | None = None,
+    save_path: str | None = None,
+    compact: bool = False,
 ) -> None:
-    if not layers or not edges:
+    """
+    Four-column biological cascade visualization (white background, single figure).
+
+    Columns (x in axes data coords [0, 1]):
+        0.03–0.10   Gene nodes (SHAP-colored rounded rectangles)
+        0.18–0.56   Pathway boxes with horizontal protein rows + PPI arcs
+        0.66–0.78   Pathway hierarchy nodes
+        0.86–0.94   HPV-status output node
+    """
+    # ── Limits by mode ────────────────────────────────────────────────────────
+    n_genes = 6  if compact else 10
+    n_boxes = 3  if compact else 5
+    n_cross = 3  if compact else 5
+    n_hier  = 2  if compact else 5
+    figw, figh = (14, 7) if compact else (20, 10)
+
+    # ── Data extraction ───────────────────────────────────────────────────────
+    top_genes = sorted(
+        cascade.get("top_genes", []),
+        key=lambda g: _safe_num(g.get("shap"), 0.0),
+        reverse=True,
+    )[:n_genes]
+    top_leaf      = cascade.get("top_leaf_pathways", [])[:n_boxes]
+    top_inter     = cascade.get("top_intermediate_pathways", [])
+    top_root      = cascade.get("top_root_pathways", [])
+    cascade_edges = cascade.get("cascade_edges", [])
+
+    if not top_genes or not top_leaf:
+        log.warning("Insufficient cascade data — skipping cascade plot.")
         return
 
-    bg = _DARK_BG if dark else _LIGHT_BG
-    txt = _DARK_TEXT if dark else _LIGHT_TEXT
-    layer_cols = _FLOW_LAYER_COLORS_DARK if dark else _FLOW_LAYER_COLORS_LIGHT
-    ax.set_facecolor(bg)
-    ax.figure.set_facecolor(bg)
-
-    # X positions distributed by existing layers only.
-    n_layers = len(layers)
-    x_positions = np.linspace(1.3, 16.7, n_layers)
-    fig_h = 12.0
-    x_min, x_max = 0.2, 17.8
-    y_min, y_max = -0.6, fig_h + 1.3
-
-    # Gradient panel background for stronger visual depth.
-    c_l = "#040A16" if dark else "#F7FAFC"
-    c_r = "#132543" if dark else "#E9EFF7"
-    grad = np.linspace(0.0, 1.0, 1024)
-    left = np.array(mpl.colors.to_rgb(c_l), dtype=float)
-    right = np.array(mpl.colors.to_rgb(c_r), dtype=float)
-    grad_rgb = (1 - grad)[None, :, None] * left + grad[None, :, None] * right
-    grad_rgb = np.repeat(grad_rgb, 4, axis=0)
-    ax.imshow(grad_rgb, extent=(x_min, x_max, y_min, y_max), aspect="auto", zorder=0)
-
-    # Subtle layer guide lines.
-    for x in x_positions:
-        ax.plot([x, x], [0.1, fig_h - 0.1], lw=0.8, color=txt, alpha=0.08, zorder=1)
-
-    # Aggregate flow totals for cleaner band thickness allocation.
-    in_flow: dict[str, float] = {}
-    out_flow: dict[str, float] = {}
-    for src, dst, w in edges:
-        out_flow[src] = out_flow.get(src, 0.0) + w
-        in_flow[dst] = in_flow.get(dst, 0.0) + w
-
-    # Layout nodes layer by layer.
-    draw_nodes: list[dict] = []
-    node_lookup: dict[str, dict] = {}
-    node_w: dict[str, float] = {}
-    width_by_kind = {
-        "gene": 1.25, "protein": 1.45, "ppi": 1.65, "group": 1.80,
-        "leaf": 1.95, "inter": 2.00, "root": 2.05, "output": 1.90,
+    # ── SHAP colormap ─────────────────────────────────────────────────────────
+    shap_signed: dict[str, float] = {
+        g["gene"]: _safe_num(g.get("shap"), 0.0) for g in top_genes
     }
+    if gene_shap_df is not None and not gene_shap_df.empty and "gene" in gene_shap_df.columns:
+        for _, row in gene_shap_df.iterrows():
+            shap_signed.setdefault(str(row["gene"]),
+                                   _safe_num(row.get("mean_abs_shap"), 0.0))
 
-    for i, layer in enumerate(layers):
-        kind = layer["kind"]
-        for rank, n in enumerate(layer["nodes"]):
-            n["value"] = max(_safe_num(n.get("value"), 0.0), 1e-9)
-            # Compress dynamic range to avoid tiny unreadable boxes.
-            n["_layout_value"] = max(np.sqrt(n["value"]), 1e-9)
-            n["_rank"] = rank
-        laid = _layout_layer(
-            layer["nodes"], "_layout_value", x_positions[i], fig_h=fig_h, pad=0.75,
-            min_h=0.30 if kind != "output" else 1.15,
-            max_h=2.15 if kind != "output" else 2.30,
+    shap_max = max((abs(v) for v in shap_signed.values()), default=1.0) or 1.0
+    shap_norm = Normalize(vmin=-shap_max, vmax=shap_max)
+
+    def _gcol(gene: str) -> tuple:
+        return _CASCADE_CMAP(shap_norm(shap_signed.get(gene, 0.0)))
+
+    # ── Gene → leaf-pathway membership ───────────────────────────────────────
+    leaf_ids   = {p["id"] for p in top_leaf}
+    leaf_info  = {p["id"]: p for p in top_leaf}
+    gene_names = {g["gene"] for g in top_genes}
+
+    gene_to_leaves: dict[str, list[str]] = {}
+    for u, v, _w in cascade_edges:
+        u, v = str(u), str(v)
+        if u in gene_names and v in leaf_ids:
+            if v not in gene_to_leaves.setdefault(u, []):
+                gene_to_leaves[u].append(v)
+
+    pathway_to_genes: dict[str, list[str]] = {}
+    for gene, pids in gene_to_leaves.items():
+        for pid in pids:
+            pathway_to_genes.setdefault(pid, []).append(gene)
+
+    # ── PPI within-pathway and cross-pathway edges ────────────────────────────
+    ppi_within: dict[str, list[tuple[str, str, float]]] = {}
+    cross_ppi_raw: list[tuple[str, str, str, str, float]] = []
+
+    if ppi_df is not None and not ppi_df.empty:
+        ga_col = "gene_a" if "gene_a" in ppi_df.columns else "gene_1"
+        gb_col = "gene_b" if "gene_b" in ppi_df.columns else "gene_2"
+        imp_col = next(
+            (c for c in ("multiplicative", "ppi_importance_mult",
+                         "ppi_importance_add", "additive")
+             if c in ppi_df.columns),
+            None,
         )
-        for ln in laid:
-            nid = ln["item"]["id"]
-            ln["flow_in"] = in_flow.get(nid, 0.0)
-            ln["flow_out"] = out_flow.get(nid, 0.0)
-            draw_nodes.append(ln)
-            node_lookup[nid] = ln
-            node_w[nid] = width_by_kind.get(kind, 1.5)
+        for _, row in ppi_df.iterrows():
+            ga = str(row.get(ga_col, ""))
+            gb = str(row.get(gb_col, ""))
+            if ga not in gene_names or gb not in gene_names:
+                continue
+            imp = _safe_num(row.get(imp_col), 0.0) if imp_col else 0.0
+            if imp <= 0:
+                continue
+            la = set(gene_to_leaves.get(ga, [])) & leaf_ids
+            lb = set(gene_to_leaves.get(gb, [])) & leaf_ids
+            for pid in la & lb:
+                ppi_within.setdefault(pid, []).append((ga, gb, imp))
+            for pa in sorted(la - lb):
+                for pb in sorted(lb - la):
+                    cross_ppi_raw.append((ga, gb, pa, pb, imp))
 
-    max_w = max((w for _, _, w in edges), default=1.0)
-    max_w = max(max_w, 1e-9)
+    cross_ppi = sorted(cross_ppi_raw, key=lambda e: e[4], reverse=True)[:n_cross]
 
-    # Draw weighted flow bands (thin first, thick last for visual prominence).
-    for src, dst, w in sorted(edges, key=lambda x: x[2]):
-        if src not in node_lookup or dst not in node_lookup:
+    # ── Hierarchy nodes (mix inter + root, top-N by attribution) ─────────────
+    all_hier = [
+        {
+            "id": str(p.get("id", "")),
+            "name": str(p.get("name", p.get("id", ""))),
+            "attribution": _safe_num(p.get("attribution"), 0.0),
+        }
+        for p in list(top_inter) + list(top_root)
+        if str(p.get("id", ""))
+    ]
+    all_hier.sort(key=lambda x: x["attribution"], reverse=True)
+    seen_hier: set[str] = set()
+    hier_nodes = []
+    for h in all_hier:
+        if h["id"] not in seen_hier:
+            seen_hier.add(h["id"])
+            hier_nodes.append(h)
+            if len(hier_nodes) == n_hier:
+                break
+
+    # ── Figure and axes ───────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(figw, figh))
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.04)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#ffffff")
+
+    # ── Layout constants ──────────────────────────────────────────────────────
+    X_GENE  = 0.065
+    GENE_W  = 0.065
+    GENE_H  = 0.052
+    X_BL    = 0.18
+    X_BR    = 0.56
+    BOX_W   = X_BR - X_BL
+    X_HL    = 0.66
+    X_HR    = 0.78
+    HIER_W  = X_HR - X_HL
+    HIER_H  = 0.042
+    X_OUT   = 0.90
+    OUT_W   = 0.075
+    OUT_H   = 0.055
+    PROT_R  = 0.010
+    HDR_FRAC = 0.22
+
+    # ── Gene y-positions (most positive SHAP at top) ──────────────────────────
+    n_g   = len(top_genes)
+    gene_ys = np.linspace(0.88, 0.10, n_g) if n_g > 1 else [0.50]
+    gene_pos: dict[str, tuple[float, float]] = {}
+    for i, ginfo in enumerate(top_genes):
+        gene_pos[ginfo["gene"]] = (X_GENE, float(gene_ys[i]))
+
+    # ── Pathway box geometry ──────────────────────────────────────────────────
+    n_b     = len(top_leaf)
+    MIN_BH  = 0.065
+    MAX_BH  = 0.14
+    gap     = 0.012
+    total_avail = 0.84 - gap * max(n_b - 1, 0)
+    avg_bh  = float(np.clip(total_avail / max(n_b, 1), MIN_BH, MAX_BH))
+
+    box_pos: dict[str, tuple[float, float, float, float]] = {}
+    protein_pos: dict[tuple[str, str], tuple[float, float]] = {}
+
+    y_cur = 0.92
+    for pinfo in top_leaf:
+        pid = pinfo["id"]
+        n_m = max(1, len(pathway_to_genes.get(pid, [])))
+        bh  = float(np.clip(avg_bh * (0.7 + 0.3 * min(n_m / 4.0, 1.0)), MIN_BH, MAX_BH))
+        bh  = min(bh, y_cur - 0.02)
+        if bh <= 0.01:
+            break
+        yb = y_cur - bh
+        box_pos[pid] = (X_BL, yb, BOX_W, bh)
+        y_cur = yb - gap
+
+    # ── Protein positions (horizontal row, centered below box header) ─────────
+    for pid, (bx, by, bw, bh) in box_pos.items():
+        genes_in = pathway_to_genes.get(pid, [])
+        if not genes_in:
             continue
-        if w <= 0:
-            continue
-        s = node_lookup[src]
-        d = node_lookup[dst]
-        s_kind = s["item"].get("kind", "gene")
-        base_col = layer_cols.get(s_kind, "#8A8A8A")
-        col = _blend_hex(base_col, "#EAF2FF" if dark else "#FFFFFF", 0.10 if dark else 0.18)
-
-        s_tot = max(_safe_num(s.get("flow_out"), 0.0), 1e-9)
-        d_tot = max(_safe_num(d.get("flow_in"), 0.0), 1e-9)
-        h_s = np.clip(s["h"] * (w / s_tot), 0.04, s["h"] * 0.95)
-        h_d = np.clip(d["h"] * (w / d_tot), 0.04, d["h"] * 0.95)
-
-        flow_strength = np.sqrt(w / max_w)
-        alpha = float(np.clip(0.09 + 0.56 * flow_strength, 0.08, 0.70))
-        _bezier_band(
-            ax,
-            s["x"] + node_w[src] / 2.0, s["y_c"], h_s,
-            d["x"] - node_w[dst] / 2.0, d["y_c"], h_d,
-            color=col, alpha=alpha, zorder=2,
-        )
-
-    # Draw nodes with improved contrast and subtle glow.
-    shap_vals = [n.get("shap", 0.0) for n in nodes.values() if n.get("kind") == "gene"]
-    vmax = max([abs(v) for v in shap_vals], default=1.0)
-    vmax = max(vmax, 1e-12)
-
-    for dn in draw_nodes:
-        item = dn["item"]
-        nid = item["id"]
-        kind = item.get("kind", "gene")
-        label = _trunc(str(item.get("label", nid)), 38 if kind in {"group", "inter", "root"} else 28)
-        width = node_w[nid]
-
-        if kind == "gene":
-            fill = _shap_to_color(_safe_num(item.get("shap"), 0.0), vmax, dark)
-        elif kind == "output":
-            fill = layer_cols.get("output", "#F8961E")
+        n_p   = len(genes_in)
+        hdr_h = bh * HDR_FRAC
+        row_y = by + (bh - hdr_h) * 0.50
+        pad_x = 0.10
+        if n_p == 1:
+            xs_rel = [0.50]
         else:
-            base = layer_cols.get(kind, "#888888")
-            rank = int(item.get("_rank", 0))
-            fill = _blend_hex(base, "#FFFFFF", 0.06 * min(rank, 5)) if dark else _blend_hex(base, "#FFFFFF", 0.10 * min(rank, 4))
+            xs_rel = [pad_x + i * (1.0 - 2 * pad_x) / (n_p - 1) for i in range(n_p)]
+        for j, gene in enumerate(genes_in):
+            protein_pos[(pid, gene)] = (bx + xs_rel[j] * bw, row_y)
 
-        edge = _blend_hex(fill, "#FFFFFF" if dark else "#1E2B43", 0.45 if dark else 0.38)
-        tcol = "white" if kind == "output" else _contrast_text(fill, dark)
+    # ── Hierarchy y-positions ─────────────────────────────────────────────────
+    n_h     = len(hier_nodes)
+    hier_ys = np.linspace(0.86, 0.14, n_h) if n_h > 1 else [0.50]
+    hier_cx = (X_HL + X_HR) / 2
+    hier_pos_map: dict[str, tuple[float, float]] = {}
+    for i, hinfo in enumerate(hier_nodes):
+        hier_pos_map[hinfo["id"]] = (hier_cx, float(hier_ys[i]))
 
-        box = mpatches.FancyBboxPatch(
-            (dn["x"] - width / 2.0, dn["y_c"] - dn["h"] / 2.0),
-            width, dn["h"],
-            boxstyle="round,pad=0.045,rounding_size=0.06",
-            facecolor=fill,
-            edgecolor=edge,
-            linewidth=1.05,
-            alpha=0.96,
-            zorder=6,
-        )
-        if dark:
-            box.set_path_effects([
-                pe.Stroke(linewidth=3.0, foreground=_blend_hex(fill, "#9FC5FF", 0.45), alpha=0.28),
-                pe.Normal(),
-            ])
-        ax.add_patch(box)
+    hier_attr_max = max((h["attribution"] for h in hier_nodes), default=1.0) or 1.0
+    leaf_attr_max = max(
+        (_safe_num(p.get("attribution"), 0.0) for p in top_leaf), default=1.0
+    ) or 1.0
+    out_cy = 0.50
 
-        if dn["h"] >= 0.24:
-            fs = float(np.clip(7.0 + 1.6 * (dn["h"] / 1.3), 6.6, 9.6))
-            txt_fx = [pe.withStroke(linewidth=1.4, foreground="#000000", alpha=0.18)] if dark else []
-            ax.text(
-                dn["x"], dn["y_c"], label,
-                ha="center", va="center",
-                fontsize=fs,
-                color=tcol,
-                fontweight="semibold" if kind in {"root", "output", "leaf"} else "medium",
-                zorder=7,
-                clip_on=True,
-                path_effects=txt_fx,
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Draw in z-order
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── 1. Gene → pathway connection lines ───────────────────────────────────
+    for gene, (gcx, gcy) in gene_pos.items():
+        sv = shap_signed.get(gene, 0.0)
+        lw = 0.8 + 2.2 * (abs(sv) / shap_max)
+        ec = _gcol(gene)
+        for pid in gene_to_leaves.get(gene, []):
+            if pid not in box_pos:
+                continue
+            tx, ty = (
+                protein_pos[(pid, gene)]
+                if (pid, gene) in protein_pos
+                else (box_pos[pid][0], box_pos[pid][1] + box_pos[pid][3] / 2)
+            )
+            ax.add_patch(mpatches.FancyArrowPatch(
+                (gcx + GENE_W / 2, gcy), (tx, ty),
+                connectionstyle="arc3,rad=0.0",
+                arrowstyle="-",
+                color=ec, linewidth=float(lw), alpha=0.30, zorder=1,
+            ))
+
+    # ── 2. Pathway → hierarchy connection lines ───────────────────────────────
+    for pinfo in top_leaf:
+        pid = pinfo["id"]
+        if pid not in box_pos:
+            continue
+        bx, by, bw, bh = box_pos[pid]
+        src_x = bx + bw
+        src_y = by + bh / 2
+        p_attr = _safe_num(pinfo.get("attribution"), 0.01)
+        lw    = float(np.clip(1.0 + 3.0 * (p_attr / leaf_attr_max), 1.0, 4.0))
+        alpha = float(np.clip(0.40 + 0.35 * (p_attr / leaf_attr_max), 0.40, 0.75))
+        for hinfo in hier_nodes:
+            hcx, hcy = hier_pos_map[hinfo["id"]]
+            ax.plot(
+                [src_x, hcx - HIER_W / 2], [src_y, hcy],
+                color="#64748B", linewidth=lw, alpha=alpha, zorder=2,
             )
 
-    # Layer captions.
-    labels = {
-        "gene": "Genes",
-        "protein": "Proteins",
-        "ppi": "PPI Pairs",
-        "group": "Pathway Groups",
-        "leaf": "Leaf Pathways",
-        "inter": "Intermediate",
-        "root": "High-Level",
-        "output": "Output",
-    }
-    for i, layer in enumerate(layers):
-        kind = layer["kind"]
-        cap = f"{labels.get(kind, kind)}\n(n={len(layer['nodes'])})"
-        cap_col = _blend_hex(layer_cols.get(kind, txt), "#FFFFFF" if dark else "#101828", 0.30 if dark else 0.15)
+    # ── 3. Hierarchy → output (arrowheads only here) ──────────────────────────
+    for hinfo in hier_nodes:
+        hcx, hcy = hier_pos_map[hinfo["id"]]
+        lw = float(np.clip(1.5 + 2.5 * (hinfo["attribution"] / hier_attr_max), 1.5, 4.0))
+        ax.add_patch(mpatches.FancyArrowPatch(
+            (hcx + HIER_W / 2, hcy),
+            (X_OUT - OUT_W / 2, out_cy),
+            connectionstyle="arc3,rad=0.0",
+            arrowstyle="-|>,head_length=6,head_width=4",
+            color="#334155",
+            linewidth=lw, alpha=0.75, zorder=3,
+            mutation_scale=6.0,
+        ))
+
+    # ── 4. Pathway box background fills ──────────────────────────────────────
+    for pid, (bx, by, bw, bh) in box_pos.items():
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (bx, by), bw, bh,
+            boxstyle="round,pad=0.006",
+            facecolor="#F8FAFC", edgecolor="none",
+            linewidth=0, zorder=4,
+        ))
+        hdr_h = bh * HDR_FRAC
+        ax.plot(
+            [bx + 0.004, bx + bw - 0.004],
+            [by + bh - hdr_h, by + bh - hdr_h],
+            color="#E2E8F0", linewidth=0.8, zorder=4,
+        )
+
+    # ── 5. PPI arcs inside boxes ──────────────────────────────────────────────
+    for pid in box_pos:
+        edges_in = sorted(ppi_within.get(pid, []), key=lambda e: e[2])
+        if not edges_in:
+            continue
+        imp_max_in = max(e[2] for e in edges_in) or 1.0
+        for ga, gb, imp in edges_in:
+            if (pid, ga) not in protein_pos or (pid, gb) not in protein_pos:
+                continue
+            ni    = float(imp / imp_max_in)
+            lw    = 1.5 + 3.5 * (ni ** 0.6)
+            alpha = 0.25 + 0.60 * ni
+            ax.add_patch(mpatches.FancyArrowPatch(
+                protein_pos[(pid, ga)],
+                protein_pos[(pid, gb)],
+                connectionstyle="arc3,rad=-0.3",
+                arrowstyle="-",
+                color="#1E293B",
+                linewidth=float(lw), alpha=float(alpha), zorder=5,
+            ))
+
+    # ── 6. Cross-pathway PPI curves + midpoint labels ─────────────────────────
+    for ga, gb, pa, pb, imp in cross_ppi:
+        pos_a = protein_pos.get((pa, ga)) or protein_pos.get((pa, gb))
+        pos_b = protein_pos.get((pb, gb)) or protein_pos.get((pb, ga))
+        if pos_a is None or pos_b is None:
+            continue
+        ni    = float(min(imp / (shap_max + 1e-9), 1.0))
+        lw    = 1.5 + 2.0 * ni
+        alpha = 0.50 + 0.30 * ni
+        ax.add_patch(mpatches.FancyArrowPatch(
+            pos_a, pos_b,
+            connectionstyle="arc3,rad=0.25",
+            arrowstyle="-",
+            color="#0D9488",
+            linewidth=float(lw), alpha=float(alpha), zorder=6,
+        ))
+        mx = (pos_a[0] + pos_b[0]) / 2
+        my = (pos_a[1] + pos_b[1]) / 2
         ax.text(
-            x_positions[i], fig_h + 0.48, cap,
-            ha="center", va="bottom", fontsize=9.4,
-            fontweight="bold", color=cap_col, zorder=8,
-            path_effects=[pe.withStroke(linewidth=1.1, foreground=bg, alpha=0.75)],
+            mx, my, f"{ga}–{gb}",
+            fontsize=5.5, ha="center", va="center", color="#0D9488", zorder=6,
+            bbox=dict(facecolor="white", alpha=0.70, edgecolor="none", pad=1),
         )
 
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.axis("off")
+    # ── 7. Protein circles ────────────────────────────────────────────────────
+    for (pid, gene), (px, py) in protein_pos.items():
+        ax.add_patch(mpatches.Circle(
+            (px, py), PROT_R,
+            facecolor=_gcol(gene), edgecolor="#475569", linewidth=0.8, zorder=7,
+        ))
 
-
-def plot_biological_cascade_sankeyish(
-    cascade: dict,
-    save_path: str | None = None,
-) -> None:
-    """Sankey-like biological cascade: gene -> protein -> PPI -> pathway hierarchy -> output."""
-    nodes, layers, edges = _build_flow_graph_from_cascade(cascade)
-    if not nodes or not layers or not edges:
-        log.warning("Insufficient cascade/PPI data for Sankey-like cascade plot.")
-        return
-
-    for dark, tag in [(True, "dark"), (False, "light")]:
-        fig, ax = plt.subplots(figsize=(20.5, 12.2))
-        _draw_sankey_cascade_panel(ax, nodes, layers, edges, dark=dark)
-        title_color = _DARK_TEXT if dark else _LIGHT_TEXT
-        ax.set_title(
-            "HPV Biological Cascade Flow",
-            fontsize=15, pad=20, color=title_color, fontweight="bold",
-        )
+    # ── 8. Protein labels ─────────────────────────────────────────────────────
+    for (pid, gene), (px, py) in protein_pos.items():
         ax.text(
-            0.5, 1.012,
-            "Gene -> Protein -> PPI interactions grouped by pathway context -> Reactome hierarchy -> Model output",
-            transform=ax.transAxes,
-            ha="center", va="bottom",
-            fontsize=10.1,
-            color=_blend_hex(title_color, "#8FA3BF" if dark else "#5A6B84", 0.30),
-            fontweight="medium",
+            px + PROT_R + 0.013, py, gene,
+            fontsize=6.5, ha="left", va="center", color="#334155",
+            zorder=8, clip_on=True,
         )
 
-        sm = plt.cm.ScalarMappable(cmap=SHAP_CMAP, norm=Normalize(-1, 1))
-        sm.set_array([])
-        cbar = plt.colorbar(
-            sm, ax=ax, orientation="horizontal", fraction=0.025,
-            pad=0.015, aspect=48, location="bottom"
+    # ── 9. Pathway box borders (crisp, drawn on top of fill) ─────────────────
+    for pid, (bx, by, bw, bh) in box_pos.items():
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (bx, by), bw, bh,
+            boxstyle="round,pad=0.006",
+            facecolor="none", edgecolor="#CBD5E1",
+            linewidth=1.0, zorder=9,
+        ))
+
+    # ── 10. Pathway header text ───────────────────────────────────────────────
+    for pid, (bx, by, bw, bh) in box_pos.items():
+        hdr_h = bh * HDR_FRAC
+        ax.text(
+            bx + bw / 2, by + bh - hdr_h / 2,
+            _trunc(leaf_info[pid]["name"], 42),
+            ha="center", va="center", fontsize=8, fontweight="bold",
+            color="#334155", zorder=10, clip_on=True,
         )
-        cbar.set_label("Gene SHAP Value (HPV− <- -> HPV+)", fontsize=9.3, color=title_color)
-        cbar.ax.tick_params(colors=title_color, labelsize=8)
-        cbar.outline.set_edgecolor(_blend_hex(title_color, "#FFFFFF" if dark else "#2E3A4D", 0.55))
-        cbar.outline.set_linewidth(0.8)
 
-        fig.patch.set_facecolor(_DARK_BG if dark else _LIGHT_BG)
-        fig.tight_layout(rect=[0, 0.04, 1, 0.97])
+    # ── 11. Gene nodes ────────────────────────────────────────────────────────
+    for gene, (gcx, gcy) in gene_pos.items():
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (gcx - GENE_W / 2, gcy - GENE_H / 2), GENE_W, GENE_H,
+            boxstyle="round,pad=0.012",
+            facecolor=_gcol(gene), edgecolor="#1E293B",
+            linewidth=1.2, zorder=11,
+        ))
 
-        sp = save_path or os.path.join(config.FIGURE_DIR, "biological_cascade_sankey")
-        base = sp.replace("biological_cascade_sankey", f"biological_cascade_sankey_{tag}")
-        if save_path:
-            _save_fig(fig, base)
-        else:
-            plt.show()
-            plt.close(fig)
+    # ── 12. Gene labels ───────────────────────────────────────────────────────
+    for ginfo in top_genes:
+        gene = ginfo["gene"]
+        gcx, gcy = gene_pos[gene]
+        ax.text(gcx, gcy + 0.010, gene,
+                ha="center", va="center", fontsize=9, fontweight="bold",
+                color="#0F172A", zorder=12)
+        ax.text(gcx, gcy - 0.012, _trunc(str(ginfo.get("protein", "")), 20),
+                ha="center", va="center", fontsize=7, style="italic",
+                color="#64748B", zorder=12)
 
+    # ── 13. Hierarchy nodes ───────────────────────────────────────────────────
+    for hinfo in hier_nodes:
+        hcx, hcy = hier_pos_map[hinfo["id"]]
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (hcx - HIER_W / 2, hcy - HIER_H / 2), HIER_W, HIER_H,
+            boxstyle="round,pad=0.006",
+            facecolor="#F1F5F9", edgecolor="#94A3B8",
+            linewidth=1.0, zorder=13,
+        ))
+
+    # ── 14. Hierarchy labels ──────────────────────────────────────────────────
+    for hinfo in hier_nodes:
+        hcx, hcy = hier_pos_map[hinfo["id"]]
+        ax.text(hcx, hcy, _trunc(hinfo["name"], 28),
+                ha="center", va="center", fontsize=7.5, color="#334155",
+                zorder=14, clip_on=True)
+
+    # ── 15. Output node + labels ──────────────────────────────────────────────
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (X_OUT - OUT_W / 2, out_cy - OUT_H / 2), OUT_W, OUT_H,
+        boxstyle="round,pad=0.006",
+        facecolor="#1E293B", edgecolor="#1E293B",
+        linewidth=1.2, zorder=15,
+    ))
+    ax.text(X_OUT, out_cy + 0.010, "HPV Status",
+            ha="center", va="center", fontsize=9.5, fontweight="bold",
+            color="white", zorder=15)
+    ax.text(X_OUT, out_cy - 0.014, "Prediction",
+            ha="center", va="center", fontsize=7.0, color="#94A3B8", zorder=15)
+
+    # ── 16. Title, column headers, legend ─────────────────────────────────────
+    ax.text(0.50, 0.975,
+            "Biological Cascade: How HPV Drives HNSCC Proliferation",
+            ha="center", va="top", fontsize=14, fontweight="medium",
+            color="#0F172A", zorder=16)
+    for label, cx in [
+        ("Genes",                          X_GENE),
+        ("Protein Interactions by Pathway", (X_BL + X_BR) / 2),
+        ("Pathway Hierarchy",              (X_HL + X_HR) / 2),
+        ("Prediction",                     X_OUT),
+    ]:
+        ax.text(cx, 0.945, label,
+                ha="center", va="center", fontsize=9, fontweight="medium",
+                color="#64748B", zorder=16)
+
+    # Legend box (data coords, bottom-right corner)
+    LEG_X0, LEG_Y0, LEG_W, LEG_H = 0.60, 0.012, 0.39, 0.082
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (LEG_X0, LEG_Y0), LEG_W, LEG_H,
+        boxstyle="round,pad=0.008",
+        facecolor="#F1F5F9", edgecolor="#E2E8F0",
+        linewidth=0.8, zorder=16,
+    ))
+
+    # Colorbar gradient (inline in axes coords)
+    cbar_grad = np.linspace(0, 1, 256).reshape(1, 256)
+    ax.imshow(
+        cbar_grad, aspect="auto", cmap=_CASCADE_CMAP,
+        extent=[LEG_X0 + 0.005, LEG_X0 + 0.140,
+                LEG_Y0 + 0.010, LEG_Y0 + 0.030],
+        zorder=17,
+    )
+    ax.text(LEG_X0 + 0.072, LEG_Y0 + 0.038,
+            "← HPV−  SHAP  HPV+ →",
+            fontsize=6.5, ha="center", va="center", color="#334155", zorder=17)
+
+    # Importance line samples
+    lx0 = LEG_X0 + 0.155
+    for i, (label, lw) in enumerate([
+        ("Low importance",  1.0),
+        ("Med importance",  2.5),
+        ("High importance", 4.5),
+    ]):
+        ly = LEG_Y0 + LEG_H - 0.018 - i * 0.022
+        ax.plot([lx0, lx0 + 0.030], [ly, ly],
+                color="#64748B", linewidth=lw, alpha=0.75, zorder=17)
+        ax.text(lx0 + 0.034, ly, label,
+                fontsize=6, va="center", color="#64748B", zorder=17)
+
+    # Cross-pathway PPI legend line
+    ly_cross = LEG_Y0 + LEG_H - 0.018 - 3 * 0.022
+    ax.plot([lx0, lx0 + 0.030], [ly_cross, ly_cross],
+            color="#0D9488", linewidth=2.0, alpha=0.75, zorder=17)
+    ax.text(lx0 + 0.034, ly_cross, "Cross-pathway PPI",
+            fontsize=6, va="center", color="#64748B", zorder=17)
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+    if save_path:
+        _save_fig(fig, save_path)
+    else:
+        plt.show()
 
 # ── 10. Model comparison radar ────────────────────────────────────────────────
 
@@ -1661,13 +1669,12 @@ def plot_network_sparsity(
         else:
             mat = np.array(C)
 
-        # Downsample if very large
+        # Downsample if very large (strided sampling keeps this dependency-free).
         max_dim = 200
         if mat.shape[0] > max_dim or mat.shape[1] > max_dim:
-            from skimage.transform import downscale_local_mean
-            fy = max(1, mat.shape[0] // max_dim)
-            fx = max(1, mat.shape[1] // max_dim)
-            mat = downscale_local_mean(mat.astype(float), (fy, fx))
+            fy = max(1, int(np.ceil(mat.shape[0] / max_dim)))
+            fx = max(1, int(np.ceil(mat.shape[1] / max_dim)))
+            mat = mat[::fy, ::fx]
 
         nnz = int((mat > 0).sum())
         total = mat.size
@@ -1732,8 +1739,9 @@ def generate_all_figures(
     gene_shap_df   = _load_csv(_fp(shap_dir, "gene_shap_values.csv"))
     pathway_df     = _load_csv(_fp(shap_dir, "pathway_importance.csv"))
     ppi_df         = _load_csv(_fp(shap_dir, "ppi_importance.csv"))
+    p2p_df         = _load_csv(_fp(shap_dir, "pathway_to_pathway_importance.csv"))
 
-    N = 10
+    N = 12
     status = {}
 
     def _run(step: int, label: str, fn, *args, **kwargs):
@@ -1745,35 +1753,37 @@ def generate_all_figures(
             print(f"  [{step}/{N}] {label:<40s} ✗  ({exc})")
             status[label] = str(exc)
 
-    # 1. PR curves
-    _run(1, "Precision-Recall curves",
-         plot_precision_recall_curves, fold_metrics,
-         _fp(figure_dir, "precision_recall_curves"))
+    if fold_metrics:
+        # 1. PR curves
+        _run(1, "Precision-Recall curves",
+             plot_precision_recall_curves, fold_metrics,
+             _fp(figure_dir, "precision_recall_curves"))
 
-    # 2. Spec-Sens curves
-    _run(2, "Specificity-Sensitivity curves",
-         plot_specificity_sensitivity_curves, fold_metrics,
-         _fp(figure_dir, "specificity_sensitivity_curves"))
+        # 2. Spec-Sens curves
+        _run(2, "Specificity-Sensitivity curves",
+             plot_specificity_sensitivity_curves, fold_metrics,
+             _fp(figure_dir, "specificity_sensitivity_curves"))
 
-    # 3. ROC curves
-    _run(3, "ROC curves",
-         plot_roc_curves, fold_metrics,
-         _fp(figure_dir, "roc_curves"))
+        # 3. ROC curves
+        _run(3, "ROC curves",
+             plot_roc_curves, fold_metrics,
+             _fp(figure_dir, "roc_curves"))
 
-    # 4. Confusion matrices
-    _run(4, "Confusion matrices",
-         plot_confusion_matrices, fold_metrics,
-         _fp(figure_dir, "confusion_matrices"))
-
-    # 5. SHAP beeswarm (requires raw SHAP values — skip if not in memory)
-    if not gene_shap_df.empty and "mean_abs_shap" in gene_shap_df.columns:
-        sv_proxy = np.diag(gene_shap_df["mean_abs_shap"].values)  # proxy 2-D
-        _run(5, "SHAP beeswarm",
-             plot_shap_beeswarm, sv_proxy,
-             gene_shap_df["gene"].tolist() if "gene" in gene_shap_df else [],
-             None, 30, _fp(figure_dir, "shap_beeswarm"))
+        # 4. Confusion matrices
+        _run(4, "Confusion matrices",
+             plot_confusion_matrices, fold_metrics,
+             _fp(figure_dir, "confusion_matrices"))
     else:
-        print(f"  [5/{N}] SHAP beeswarm                           – (gene_shap_values.csv missing)")
+        print(f"  [1/{N}] Precision-Recall curves                  – (nested_cv_results.json missing)")
+        print(f"  [2/{N}] Specificity-Sensitivity curves           – (nested_cv_results.json missing)")
+        print(f"  [3/{N}] ROC curves                               – (nested_cv_results.json missing)")
+        print(f"  [4/{N}] Confusion matrices                       – (nested_cv_results.json missing)")
+
+    # 5. SHAP beeswarm needs per-sample SHAP arrays; aggregated CSV is insufficient.
+    print(
+        f"  [5/{N}] SHAP beeswarm                           – "
+        "(requires per-sample SHAP arrays; not saved in current artifacts)"
+    )
 
     # 6. SHAP bar
     _run(6, "SHAP gene importance bar",
@@ -1789,26 +1799,56 @@ def generate_all_figures(
     _run(8, "PPI network",
          plot_ppi_importance, ppi_df, 20,
          _fp(figure_dir, "ppi_network"))
+    _run(8, "PPI full map (all edges)",
+         plot_full_ppi_map, ppi_df,
+         _fp(figure_dir, "ppi_full_map"))
 
-    # 9. Biological cascade (sankey-like, dark + light)
+    # 9. Biological cascade — full (20×10 in) and compact (14×7 in)
     if cascade:
-        _run(9, "Biological cascade Sankey-like",
-             plot_biological_cascade_sankeyish, cascade,
-             _fp(figure_dir, "biological_cascade_sankey"))
+        _run(9, "Biological cascade (full)",
+             plot_biological_cascade, cascade, gene_shap_df, pathway_df, ppi_df, p2p_df,
+             _fp(figure_dir, "cascade_full"), False)
+        _run(9, "Biological cascade (compact)",
+             plot_biological_cascade, cascade, gene_shap_df, pathway_df, ppi_df, p2p_df,
+             _fp(figure_dir, "cascade_compact"), True)
     else:
         print(f"  [9/{N}] Biological cascade                       – (hpv_cascade.json missing)")
 
     # 10. Model comparison (radar + boxplot + training)
-    _run(10, "Model comparison radar",
-         plot_model_comparison_radar, fold_metrics,
-         _fp(figure_dir, "model_comparison_radar"))
-    _run(10, "Model comparison boxplot",
-         plot_model_comparison_boxplot, fold_metrics,
-         stat_tests_df if not stat_tests_df.empty else None,
-         _fp(figure_dir, "model_comparison_boxplot"))
-    _run(10, "Training curves",
-         plot_training_curves, histories,
-         _fp(figure_dir, "binn_training_curves"))
+    if fold_metrics:
+        _run(10, "Model comparison radar",
+             plot_model_comparison_radar, fold_metrics,
+             _fp(figure_dir, "model_comparison_radar"))
+        _run(10, "Model comparison boxplot",
+             plot_model_comparison_boxplot, fold_metrics,
+             stat_tests_df if not stat_tests_df.empty else None,
+             _fp(figure_dir, "model_comparison_boxplot"))
+    else:
+        print(f"  [10/{N}] Model comparison radar                  – (nested_cv_results.json missing)")
+        print(f"  [10/{N}] Model comparison boxplot                – (nested_cv_results.json missing)")
+    if histories:
+        _run(10, "Training curves",
+             plot_training_curves, histories,
+             _fp(figure_dir, "binn_training_curves"))
+    else:
+        print(f"  [10/{N}] Training curves                          – (training_histories.json missing)")
+
+    # 12. Network sparsity (if fold network info available)
+    import pickle as _pickle
+    _fni_path = getattr(config, "FOLD_NETWORK_INFO_FILE", "")
+    if _fni_path and os.path.exists(_fni_path):
+        try:
+            with open(_fni_path, "rb") as _f:
+                _fni = _pickle.load(_f)
+            if _fni and _fni[0] is not None:
+                _conn = _fni[0].get("connectivity_matrices", [])
+                _run(12, "Network sparsity",
+                     plot_network_sparsity, _conn,
+                     _fp(figure_dir, "network_sparsity"))
+        except Exception:
+            print(f"  [12/{N}] Network sparsity                         – (load failed)")
+    else:
+        print(f"  [12/{N}] Network sparsity                         – (fold_network_info.pkl missing)")
 
     print(f"\nAll figures saved to {figure_dir}/")
 

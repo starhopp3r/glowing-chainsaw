@@ -19,6 +19,7 @@ import logging
 import os
 import pickle
 import sys
+import warnings
 from typing import Any
 
 import networkx as nx
@@ -72,6 +73,20 @@ def _gradient_times_input(
 
 # ── Input-layer SHAP ──────────────────────────────────────────────────────────
 
+def _deep_explainer_blockers(model: nn.Module) -> list[str]:
+    """
+    Return unsupported module names for DeepExplainer in this architecture.
+
+    SHAP's PyTorch DeepExplainer does not robustly support ``nn.Mish`` in
+    additivity checks, so we route to GradientExplainer when present.
+    """
+    blockers: set[str] = set()
+    for mod in model.modules():
+        if isinstance(mod, nn.Mish):
+            blockers.add("Mish")
+    return sorted(blockers)
+
+
 def compute_shap_values(
     model: BINN,
     X_test: np.ndarray,
@@ -81,8 +96,10 @@ def compute_shap_values(
     """
     Compute SHAP values at the gene (input) layer.
 
-    Uses shap.DeepExplainer on CPU (avoids MPS hook instability). Falls back
-    to GradientExplainer and then Gradient×Input if needed.
+    Uses shap.DeepExplainer on CPU (avoids MPS hook instability) when
+    architecture support is available. For known unsupported modules (e.g.
+    ``nn.Mish``), it skips DeepExplainer and uses GradientExplainer directly.
+    Falls back to Gradient×Input if SHAP methods fail.
 
     Parameters
     ----------
@@ -109,9 +126,6 @@ def compute_shap_values(
 
     X_test_t = torch.from_numpy(X_test.astype(np.float32))
 
-    # Move to CPU for SHAP
-    model_cpu = model.cpu()
-
     def _parse_shap(vals) -> np.ndarray:
         if isinstance(vals, list):
             vals = vals[0]
@@ -122,28 +136,47 @@ def compute_shap_values(
             arr = arr.squeeze(-1)
         return arr
 
-    # 1. Try DeepExplainer
+    # Move to CPU for SHAP; always restore to original device on exit.
+    model.cpu()
     try:
-        explainer = shap.DeepExplainer(model_cpu, background)
-        shap_vals = _parse_shap(explainer.shap_values(X_test_t))
-        log.info(f"DeepExplainer SHAP: shape={shap_vals.shape}")
-        model.to(device)
-        return shap_vals
-    except Exception as exc:
-        log.warning(f"DeepExplainer failed ({exc}). Trying GradientExplainer...")
+        blockers = _deep_explainer_blockers(model)
+        if blockers:
+            log.info(
+                "Skipping DeepExplainer due to unsupported module(s): %s. "
+                "Using GradientExplainer.",
+                ", ".join(blockers),
+            )
+        else:
+            # 1. Try DeepExplainer
+            try:
+                with warnings.catch_warnings():
+                    # DeepExplainer may emit unrecognized nn.Module warnings for some
+                    # architectures; we treat those as non-fatal and rely on fallback.
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r"unrecognized nn\.Module: .*",
+                        category=UserWarning,
+                    )
+                    explainer = shap.DeepExplainer(model, background)
+                    shap_vals = _parse_shap(explainer.shap_values(X_test_t))
+                log.info(f"DeepExplainer SHAP: shape={shap_vals.shape}")
+                return shap_vals
+            except Exception as exc:
+                log.info(f"DeepExplainer skipped/failed ({exc}). Trying GradientExplainer...")
 
-    # 2. Try GradientExplainer
-    try:
-        explainer = shap.GradientExplainer(model_cpu, background)
-        shap_vals = _parse_shap(explainer.shap_values(X_test_t))
-        log.info(f"GradientExplainer SHAP: shape={shap_vals.shape}")
-        model.to(device)
-        return shap_vals
-    except Exception as exc2:
-        log.warning(f"GradientExplainer failed ({exc2}). Falling back to Gradient×Input.")
+        # 2. Try GradientExplainer
+        try:
+            explainer = shap.GradientExplainer(model, background)
+            shap_vals = _parse_shap(explainer.shap_values(X_test_t))
+            log.info(f"GradientExplainer SHAP: shape={shap_vals.shape}")
+            return shap_vals
+        except Exception as exc2:
+            log.warning(f"GradientExplainer failed ({exc2}). Falling back to Gradient×Input.")
 
-    model.to(device)
-    return _gradient_times_input(model, X_test, device)
+        model.to(device)
+        return _gradient_times_input(model, X_test, device)
+    finally:
+        model.to(device)
 
 
 # ── Layer-wise Gradient × Activation ─────────────────────────────────────────
@@ -376,6 +409,447 @@ def analyze_ppi_importance(
     return df.sort_values("ppi_importance_add", ascending=False).reset_index(drop=True)
 
 
+# ── Level 1: Protein-to-Protein SHAP ─────────────────────────────────────────
+
+def compute_ppi_shap(
+    shap_values: np.ndarray,
+    gene_names: list[str],
+    ppi_edge_to_pathways: dict,
+    bio_map: dict,
+) -> pd.DataFrame:
+    """
+    Score each STRING PPI edge by the SHAP values of its two endpoint proteins.
+
+    Parameters
+    ----------
+    shap_values         : (n_samples, n_genes) signed SHAP array
+    gene_names          : gene symbols matching shap_values columns
+    ppi_edge_to_pathways: from ppi_overlay["ppi_edge_to_pathways"]
+                          keys = (gene_a, gene_b), values = dict with
+                          "score", "shared_pathways", "cross_pathways"
+    bio_map             : full biological map (for protein name lookup)
+
+    Returns
+    -------
+    pd.DataFrame sorted by multiplicative descending.
+    """
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    mean_signed_shap = shap_values.mean(axis=0)
+    gene_abs: dict[str, float] = dict(zip(gene_names, mean_abs_shap.tolist()))
+    gene_signed: dict[str, float] = dict(zip(gene_names, mean_signed_shap.tolist()))
+
+    node_meta = bio_map.get("node_metadata", {})
+    reactome_names = bio_map.get("reactome_names", {})
+
+    rows = []
+    for (ga, gb), info in ppi_edge_to_pathways.items():
+        sa = gene_abs.get(ga)
+        sb = gene_abs.get(gb)
+        if sa is None or sb is None:
+            continue
+
+        shared = info.get("shared_pathways", [])
+        cross = info.get("cross_pathways", [])
+        pathway_ctx = sorted(set(shared + [p for pair in cross for p in pair]))
+
+        rows.append({
+            "gene_a": ga,
+            "gene_b": gb,
+            "protein_a": node_meta.get(ga, {}).get("name", ga),
+            "protein_b": node_meta.get(gb, {}).get("name", gb),
+            "string_score": info.get("score", 0),
+            "shap_a": float(sa),
+            "shap_b": float(sb),
+            "additive": float(sa + sb),
+            "multiplicative": float(sa * sb),
+            "directional": float(gene_signed.get(ga, 0.0) + gene_signed.get(gb, 0.0)),
+            "pathway_context": [reactome_names.get(p, p) for p in pathway_ctx],
+            "is_cross_pathway": len(cross) > 0,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("multiplicative", ascending=False).reset_index(drop=True)
+
+
+# ── Level 2a: Pathway-level SHAP ─────────────────────────────────────────────
+
+def compute_pathway_shap(
+    shap_values: np.ndarray,
+    gene_names: list[str],
+    gene_to_reactome: dict[str, set[str]],
+    reactome_names: dict[str, str],
+    pathway_ppi_subgraphs: dict | None = None,
+    hierarchy_depth: dict[str, int] | None = None,
+) -> pd.DataFrame:
+    """
+    Compute per-pathway SHAP statistics with extra metadata vs the basic
+    aggregate_shap_to_pathways().
+
+    Parameters
+    ----------
+    shap_values            : (n_samples, n_genes)
+    gene_names             : matching gene names
+    gene_to_reactome       : gene → set[pathway_id]
+    reactome_names         : pathway_id → display name
+    pathway_ppi_subgraphs  : from ppi_overlay, optional
+    hierarchy_depth        : {pathway_id: depth_int}, optional
+
+    Returns
+    -------
+    pd.DataFrame sorted by mean_abs_shap descending.
+    """
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    mean_signed_shap = shap_values.mean(axis=0)
+    median_abs = float(np.median(mean_abs_shap))
+
+    gene_abs: dict[str, float] = dict(zip(gene_names, mean_abs_shap.tolist()))
+    gene_signed: dict[str, float] = dict(zip(gene_names, mean_signed_shap.tolist()))
+
+    pathway_ppi_subgraphs = pathway_ppi_subgraphs or {}
+    hierarchy_depth = hierarchy_depth or {}
+
+    # Build pathway → genes in our network
+    pathway_to_genes: dict[str, list[str]] = {}
+    for gene, pathways in gene_to_reactome.items():
+        if gene not in gene_abs:
+            continue
+        for pid in pathways:
+            pathway_to_genes.setdefault(pid, []).append(gene)
+
+    rows = []
+    for pid, genes in pathway_to_genes.items():
+        vals_abs = [gene_abs[g] for g in genes if g in gene_abs]
+        if not vals_abs:
+            continue
+        arr = np.array(vals_abs)
+        top_idx = int(np.argmax(arr))
+        n_sig = int((arr > median_abs).sum())
+
+        # PPI info for this pathway
+        subgraph = pathway_ppi_subgraphs.get(pid, {})
+        ppi_edges_p = subgraph.get("ppi_edges", [])
+        n_ppi = len(ppi_edges_p)
+        top_ppi = ("", "")
+        if ppi_edges_p:
+            best = max(ppi_edges_p, key=lambda e: gene_abs.get(e[0], 0) + gene_abs.get(e[1], 0))
+            top_ppi = (best[0], best[1])
+
+        directional = sum(gene_signed.get(g, 0.0) for g in genes)
+
+        rows.append({
+            "pathway_id": pid,
+            "pathway_name": reactome_names.get(pid, pid),
+            "hierarchy_level": hierarchy_depth.get(pid, -1),
+            "mean_abs_shap": float(arr.mean()),
+            "sum_abs_shap": float(arr.sum()),
+            "max_abs_shap": float(arr.max()),
+            "n_genes": len(vals_abs),
+            "n_significant_genes": n_sig,
+            "n_ppi_edges": n_ppi,
+            "top_gene": genes[top_idx],
+            "top_ppi_a": top_ppi[0],
+            "top_ppi_b": top_ppi[1],
+            "directional": float(directional),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+
+# ── Level 2b: Pathway-to-Pathway SHAP via Gradient × Activation ──────────────
+
+def compute_pathway_to_pathway_shap(
+    model: "BINN",
+    X_test: np.ndarray,
+    layer_node_names: list[list[str]],
+    reactome_hierarchy: nx.DiGraph,
+    reactome_names: dict[str, str],
+    ppi_overlay: dict | None = None,
+    device: torch.device | None = None,
+) -> pd.DataFrame:
+    """
+    Gradient × Activation attributions for each pathway→pathway edge.
+
+    For each edge (child_pathway in layer ℓ) → (parent_pathway in layer ℓ+1):
+        attribution = |grad_at_parent| * |act_at_child|, averaged over samples.
+
+    Parameters
+    ----------
+    model               : trained BINN
+    X_test              : (n_test, n_genes) float32
+    layer_node_names    : from build_fold_network()
+    reactome_hierarchy  : from bio_map["reactome_hierarchy"]
+    reactome_names      : from bio_map["reactome_names"]
+    ppi_overlay         : from fold_network_info["ppi_overlay"] (for cross-pathway labels)
+    device              : torch device
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        child_pathway, child_name, parent_pathway, parent_name,
+        layer, attribution, connection_type
+    """
+    from src.binn_model import BINN  # local import to avoid circular
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    model.eval()
+    X_t = torch.from_numpy(X_test.astype(np.float32)).to(device)
+
+    fwd_acts: dict[int, torch.Tensor] = {}
+    bwd_grads: dict[int, torch.Tensor] = {}
+    handles: list = []
+
+    def _fwd(idx: int):
+        def hook(module, inp, out):
+            fwd_acts[idx] = out.detach().cpu()
+        return hook
+
+    def _bwd(idx: int):
+        def hook(module, grad_inp, grad_out):
+            if grad_out and grad_out[0] is not None:
+                bwd_grads[idx] = grad_out[0].detach().cpu()
+        return hook
+
+    for i, layer in enumerate(model.hidden_layers):
+        handles.append(layer.register_forward_hook(_fwd(i)))
+        handles.append(layer.register_full_backward_hook(_bwd(i)))
+
+    try:
+        X_t.requires_grad_(True)
+        logits = model(X_t)
+        logits.sum().backward()
+    except Exception as exc:
+        log.warning(f"compute_pathway_to_pathway_shap: backward failed ({exc})")
+        return pd.DataFrame()
+    finally:
+        for h in handles:
+            h.remove()
+
+    # Build cross-pathway PPI set for connection_type labelling
+    cross_ppi_pairs: set[tuple[str, str]] = set()
+    if ppi_overlay:
+        for entry in ppi_overlay.get("cross_pathway_ppi_edges", []):
+            cross_ppi_pairs.add((entry["pathway_a"], entry["pathway_b"]))
+            cross_ppi_pairs.add((entry["pathway_b"], entry["pathway_a"]))
+
+    rows = []
+    n_hidden = len(model.hidden_layers)
+    # layer index i in hidden_layers corresponds to layer_node_names[i+1]
+    # attribution for edge child(layer l) → parent(layer l+1):
+    #   acts at layer l (child) = fwd_acts[l-1] (hidden layer index l-1)
+    #   grads at layer l+1 (parent) = bwd_grads[l]
+    for l in range(1, len(layer_node_names) - 1):
+        child_names = layer_node_names[l]
+        parent_names = layer_node_names[l + 1] if l + 1 < len(layer_node_names) else []
+
+        act_key = l - 1   # hidden layer index
+        grad_key = l      # hidden layer index for parent
+
+        if act_key not in fwd_acts or grad_key not in bwd_grads:
+            continue
+
+        acts = fwd_acts[act_key]   # (n, n_child)
+        grads = bwd_grads[grad_key]  # (n, n_parent)
+        n = min(acts.shape[0], grads.shape[0])
+
+        # Mean |act| per child node
+        mean_act = acts[:n].abs().mean(0).numpy()   # (n_child,)
+        # Mean |grad| per parent node
+        mean_grad = grads[:n].abs().mean(0).numpy()  # (n_parent,)
+
+        # For each Reactome hierarchy edge between child and parent layers
+        for ci, cnode in enumerate(child_names):
+            if ci >= len(mean_act):
+                continue
+            for pi, pnode in enumerate(parent_names):
+                if pi >= len(mean_grad):
+                    continue
+                # Only record edges that exist in the hierarchy
+                if not reactome_hierarchy.has_node(cnode) or not reactome_hierarchy.has_node(pnode):
+                    continue
+                # Reactome hierarchy: parent→child (general→specific).
+                # In our flow graph child→parent. Check either direction.
+                if not (reactome_hierarchy.has_edge(pnode, cnode) or
+                        reactome_hierarchy.has_edge(cnode, pnode)):
+                    continue
+
+                attr = float(mean_act[ci] * mean_grad[pi])
+                pair = (cnode, pnode)
+                ctype = "ppi_crosstalk" if pair in cross_ppi_pairs else "hierarchy"
+
+                rows.append({
+                    "child_pathway": cnode,
+                    "child_name": reactome_names.get(cnode, cnode),
+                    "parent_pathway": pnode,
+                    "parent_name": reactome_names.get(pnode, pnode),
+                    "layer": l,
+                    "attribution": attr,
+                    "connection_type": ctype,
+                })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("attribution", ascending=False).reset_index(drop=True)
+
+
+# ── Cross-fold dual SHAP aggregation ─────────────────────────────────────────
+
+def aggregate_dual_shap(
+    fold_results: list[dict],
+    output_dir: str = config.SHAP_DIR,
+    n_folds_total: int = 5,
+    top_k: int = 20,
+) -> dict:
+    """
+    Average PPI-level and pathway-level SHAP importance across folds.
+    Flags high-confidence findings (top-K in >= 4/5 folds).
+    Saves all aggregated tables to output_dir.
+
+    Parameters
+    ----------
+    fold_results   : list of per-fold dicts, each with keys:
+                     "ppi_shap_df", "pathway_shap_df", "p2p_shap_df"
+    output_dir     : where to save CSV files
+    n_folds_total  : used for stability threshold
+    top_k          : top-K threshold for high-confidence flag
+
+    Returns
+    -------
+    dict with keys: ppi_df, pathway_df, p2p_df, stability_df
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    def _edge_key(row):
+        return tuple(sorted([row["gene_a"], row["gene_b"]]))
+
+    # ── PPI aggregation ───────────────────────────────────────────────────────
+    ppi_top_counts: dict[tuple, int] = {}
+    ppi_all: list[pd.DataFrame] = []
+    for res in fold_results:
+        df = res.get("ppi_shap_df", pd.DataFrame())
+        if df.empty:
+            continue
+        df = df.copy()
+        df["edge_key"] = df.apply(_edge_key, axis=1)
+        # Track top-K membership
+        for ek in df.head(top_k)["edge_key"]:
+            ppi_top_counts[ek] = ppi_top_counts.get(ek, 0) + 1
+        ppi_all.append(df)
+
+    ppi_df = pd.DataFrame()
+    if ppi_all:
+        combined = pd.concat(ppi_all, ignore_index=True)
+        agg = (combined.groupby("edge_key")
+               .agg(
+                   gene_a=("gene_a", "first"),
+                   gene_b=("gene_b", "first"),
+                   protein_a=("protein_a", "first"),
+                   protein_b=("protein_b", "first"),
+                   string_score=("string_score", "first"),
+                   shap_a=("shap_a", "mean"),
+                   shap_b=("shap_b", "mean"),
+                   additive=("additive", "mean"),
+                   multiplicative=("multiplicative", "mean"),
+                   directional=("directional", "mean"),
+                   is_cross_pathway=("is_cross_pathway", "first"),
+               )
+               .reset_index())
+        agg["top_k_folds"] = agg["edge_key"].map(lambda k: ppi_top_counts.get(k, 0))
+        agg["high_confidence"] = agg["top_k_folds"] >= max(1, n_folds_total - 1)
+        ppi_df = agg.sort_values("multiplicative", ascending=False).reset_index(drop=True)
+        ppi_df.to_csv(os.path.join(output_dir, "ppi_importance.csv"), index=False)
+        log.info(f"Saved ppi_importance.csv ({len(ppi_df)} edges)")
+
+    # ── Pathway aggregation ───────────────────────────────────────────────────
+    pw_top_counts: dict[str, int] = {}
+    pw_all: list[pd.DataFrame] = []
+    for res in fold_results:
+        df = res.get("pathway_shap_df", pd.DataFrame())
+        if df.empty:
+            continue
+        for pid in df.head(top_k)["pathway_id"]:
+            pw_top_counts[pid] = pw_top_counts.get(pid, 0) + 1
+        pw_all.append(df)
+
+    pathway_df = pd.DataFrame()
+    if pw_all:
+        combined = pd.concat(pw_all, ignore_index=True)
+        agg = (combined.groupby("pathway_id")
+               .agg(
+                   pathway_name=("pathway_name", "first"),
+                   hierarchy_level=("hierarchy_level", "first"),
+                   mean_abs_shap=("mean_abs_shap", "mean"),
+                   sum_abs_shap=("sum_abs_shap", "mean"),
+                   max_abs_shap=("max_abs_shap", "mean"),
+                   n_genes=("n_genes", "first"),
+                   n_significant_genes=("n_significant_genes", "mean"),
+                   n_ppi_edges=("n_ppi_edges", "first"),
+                   top_gene=("top_gene", "first"),
+                   directional=("directional", "mean"),
+               )
+               .reset_index())
+        agg["top_k_folds"] = agg["pathway_id"].map(lambda p: pw_top_counts.get(p, 0))
+        agg["high_confidence"] = agg["top_k_folds"] >= max(1, n_folds_total - 1)
+        pathway_df = agg.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+        pathway_df.to_csv(os.path.join(output_dir, "pathway_importance.csv"), index=False)
+        log.info(f"Saved pathway_importance.csv ({len(pathway_df)} pathways)")
+
+    # ── Pathway-to-pathway aggregation ───────────────────────────────────────
+    p2p_all: list[pd.DataFrame] = []
+    for res in fold_results:
+        df = res.get("p2p_shap_df", pd.DataFrame())
+        if not df.empty:
+            p2p_all.append(df)
+
+    p2p_df = pd.DataFrame()
+    if p2p_all:
+        combined = pd.concat(p2p_all, ignore_index=True)
+        agg = (combined.groupby(["child_pathway", "parent_pathway"])
+               .agg(
+                   child_name=("child_name", "first"),
+                   parent_name=("parent_name", "first"),
+                   layer=("layer", "first"),
+                   attribution=("attribution", "mean"),
+                   connection_type=("connection_type", "first"),
+               )
+               .reset_index())
+        p2p_df = agg.sort_values("attribution", ascending=False).reset_index(drop=True)
+        p2p_df.to_csv(os.path.join(output_dir, "pathway_to_pathway_importance.csv"), index=False)
+        log.info(f"Saved pathway_to_pathway_importance.csv ({len(p2p_df)} edges)")
+
+    # ── Cross-fold stability ──────────────────────────────────────────────────
+    stab_rows = []
+    for ek, cnt in ppi_top_counts.items():
+        stab_rows.append({"type": "ppi", "key": str(ek), "top_k_folds": cnt,
+                          "high_confidence": cnt >= max(1, n_folds_total - 1)})
+    for pid, cnt in pw_top_counts.items():
+        stab_rows.append({"type": "pathway", "key": pid, "top_k_folds": cnt,
+                          "high_confidence": cnt >= max(1, n_folds_total - 1)})
+    stability_df = pd.DataFrame(stab_rows)
+    if not stability_df.empty and "top_k_folds" in stability_df.columns:
+        stability_df = stability_df.sort_values("top_k_folds", ascending=False)
+    else:
+        stability_df = pd.DataFrame(
+            columns=["type", "key", "top_k_folds", "high_confidence"]
+        )
+    stability_df.to_csv(os.path.join(output_dir, "cross_fold_stability.csv"), index=False)
+    log.info(f"Saved cross_fold_stability.csv ({len(stability_df)} entries)")
+
+    return {
+        "ppi_df": ppi_df,
+        "pathway_df": pathway_df,
+        "p2p_df": p2p_df,
+        "stability_df": stability_df,
+    }
+
+
 # ── HPV cascade reconstruction ────────────────────────────────────────────────
 
 def reconstruct_hpv_cascade(
@@ -520,7 +994,7 @@ def reconstruct_hpv_cascade(
                         pid, parent,
                         weight=float(ancestors_by_score.get(parent, 0))
                     )
-        except Exception:
+        except nx.NetworkXError:
             pass
 
     cascade_edges = [
@@ -574,7 +1048,10 @@ def aggregate_shap_across_folds(
             gene_fold_shap.setdefault(gene, []).append(float(v))
 
     gene_mean: dict[str, float] = {g: float(np.mean(v)) for g, v in gene_fold_shap.items()}
-    gene_std: dict[str, float] = {g: float(np.std(v)) for g, v in gene_fold_shap.items()}
+    gene_std: dict[str, float] = {
+        g: float(np.std(v, ddof=1) if len(v) > 1 else 0.0)
+        for g, v in gene_fold_shap.items()
+    }
 
     # Rank stability: how many folds does each gene appear in top-20?
     top20_counts: dict[str, int] = {}
@@ -682,12 +1159,12 @@ def save_shap_results(
 
     Files written
     -------------
-    gene_shap_values.csv        — per-gene mean |SHAP| and std across folds
-    pathway_importance.csv      — pathway-level aggregated SHAP
-    ppi_importance.csv          — PPI edge importance scores
-    hpv_cascade.json            — reconstructed proliferation cascade
-    layerwise_attributions.json — per-layer node attributions (all folds)
-    fold_shap_stability.csv     — cross-fold gene rank stability
+    gene_shap_values.csv            — per-gene mean |SHAP| and std across folds
+    pathway_importance_legacy.csv   — legacy pathway aggregation table
+    ppi_importance_legacy.csv       — legacy PPI aggregation table
+    hpv_cascade.json                — reconstructed proliferation cascade
+    layerwise_attributions.json     — per-layer node attributions (all folds)
+    fold_shap_stability.csv         — cross-fold gene rank stability
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -701,17 +1178,24 @@ def save_shap_results(
     gene_df.to_csv(os.path.join(output_dir, "gene_shap_values.csv"), index=False)
     log.info(f"Saved gene SHAP → {output_dir}/gene_shap_values.csv")
 
-    # 2. Pathway importance
+    # 2. Legacy pathway importance (dual-level table is written separately
+    # by aggregate_dual_shap to pathway_importance.csv).
     pw_df = cross_fold.get("pathway_mean_shap", pd.DataFrame())
     if not pw_df.empty:
-        pw_df.to_csv(os.path.join(output_dir, "pathway_importance.csv"), index=False)
-        log.info(f"Saved pathway importance → {output_dir}/pathway_importance.csv")
+        pw_df.to_csv(
+            os.path.join(output_dir, "pathway_importance_legacy.csv"), index=False
+        )
+        log.info(
+            f"Saved legacy pathway importance → "
+            f"{output_dir}/pathway_importance_legacy.csv"
+        )
 
-    # 3. PPI importance
+    # 3. Legacy PPI importance (dual-level table is written separately
+    # by aggregate_dual_shap to ppi_importance.csv).
     ppi_df = cross_fold.get("ppi_mean_importance", pd.DataFrame())
     if not ppi_df.empty:
-        ppi_df.to_csv(os.path.join(output_dir, "ppi_importance.csv"), index=False)
-        log.info(f"Saved PPI importance → {output_dir}/ppi_importance.csv")
+        ppi_df.to_csv(os.path.join(output_dir, "ppi_importance_legacy.csv"), index=False)
+        log.info(f"Saved legacy PPI importance → {output_dir}/ppi_importance_legacy.csv")
 
     # 4. HPV cascade (from fold 0, as representative)
     cascade_key = "cascade"
@@ -753,6 +1237,7 @@ def run_shap_analysis(
     fold_data    : list of dicts with keys X_train, y_train, X_test, y_test, gene_names
     bio_map      : from build_full_biological_map()
     network_info : list of dicts from build_fold_network(), one per fold
+                   (each may contain "ppi_overlay" key from Prompt 8)
 
     Saves all results to config.SHAP_DIR.
     """
@@ -760,6 +1245,13 @@ def run_shap_analysis(
     gene_to_reactome: dict[str, set] = bio_map.get("gene_to_reactome", {})
     ppi_edges: list = bio_map.get("ppi_edges", [])
     hierarchy: nx.DiGraph = bio_map.get("reactome_hierarchy", nx.DiGraph())
+
+    # Hierarchy depth for pathway_shap
+    try:
+        from src.biological_mapping import get_pathway_depth
+        hierarchy_depth = get_pathway_depth(hierarchy)
+    except Exception:
+        hierarchy_depth = {}
 
     fold_results: list[dict] = []
 
@@ -773,6 +1265,7 @@ def run_shap_analysis(
         layer_sizes = net["layer_sizes"]
         layer_node_names = net["layer_node_names"]
         node_metadata = net.get("node_metadata", {})
+        ppi_overlay = net.get("ppi_overlay", {})
 
         if isinstance(fold_model, (str, os.PathLike)):
             model = BINN(conn_mats, layer_sizes, dropout_rate=config.DROPOUT_RATE)
@@ -796,19 +1289,39 @@ def run_shap_analysis(
             model, X_test, X_train, layer_node_names, config.DEVICE
         )
 
-        # ── Pathway aggregation ───────────────────────────────────────────────
+        # ── Pathway aggregation (legacy) ──────────────────────────────────────
         pathway_df = aggregate_shap_to_pathways(
             shap_vals, gene_names, gene_to_reactome, reactome_names
         )
 
-        # ── PPI importance ────────────────────────────────────────────────────
+        # ── PPI importance (legacy) ───────────────────────────────────────────
         fold_ppi_edges = [
             (g1, g2, s) for g1, g2, s in ppi_edges
-            if g1 in gene_names or g2 in gene_names
+            if g1 in gene_names and g2 in gene_names
         ]
         ppi_df = analyze_ppi_importance(
             shap_vals, gene_names, fold_ppi_edges,
             node_metadata, gene_to_reactome,
+        )
+
+        # ── Level 1: Protein-to-Protein SHAP (Prompt 8) ──────────────────────
+        ppi_edge_to_pathways = ppi_overlay.get("ppi_edge_to_pathways", {})
+        ppi_shap_df = compute_ppi_shap(
+            shap_vals, gene_names, ppi_edge_to_pathways, bio_map
+        )
+
+        # ── Level 2a: Pathway SHAP with extra metadata (Prompt 8) ────────────
+        pathway_ppi_subgraphs = ppi_overlay.get("pathway_ppi_subgraphs", {})
+        pathway_shap_df = compute_pathway_shap(
+            shap_vals, gene_names, gene_to_reactome, reactome_names,
+            pathway_ppi_subgraphs=pathway_ppi_subgraphs,
+            hierarchy_depth=hierarchy_depth,
+        )
+
+        # ── Level 2b: Pathway-to-pathway SHAP (Prompt 8) ─────────────────────
+        p2p_shap_df = compute_pathway_to_pathway_shap(
+            model, X_test, layer_node_names, hierarchy, reactome_names,
+            ppi_overlay=ppi_overlay, device=config.DEVICE,
         )
 
         # ── Cascade reconstruction ────────────────────────────────────────────
@@ -824,6 +1337,9 @@ def run_shap_analysis(
             "layerwise": layerwise,
             "pathway_df": pathway_df,
             "ppi_df": ppi_df,
+            "ppi_shap_df": ppi_shap_df,
+            "pathway_shap_df": pathway_shap_df,
+            "p2p_shap_df": p2p_shap_df,
             "cascade": cascade,
         })
 
@@ -836,6 +1352,9 @@ def run_shap_analysis(
 
     # ── Aggregate across folds ────────────────────────────────────────────────
     cross_fold = aggregate_shap_across_folds(fold_results)
+
+    # ── Dual-level aggregation (Prompt 8) ─────────────────────────────────────
+    aggregate_dual_shap(fold_results, output_dir=config.SHAP_DIR, n_folds_total=len(fold_results))
 
     # ── Save ─────────────────────────────────────────────────────────────────
     save_shap_results(cross_fold, fold_results)

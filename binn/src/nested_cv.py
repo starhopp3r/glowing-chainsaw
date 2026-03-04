@@ -386,7 +386,7 @@ class NestedCrossValidator:
         X_test_binn = X_test[:, binn_gene_idx]
 
         # Stratified split for inner BINN validation
-        inner_skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.RANDOM_SEED + fold_idx)
+        inner_skf = StratifiedKFold(n_splits=config.BINN_VAL_SPLITS, shuffle=True, random_state=config.RANDOM_SEED + fold_idx)
         binn_inner_splits = list(inner_skf.split(X_train_binn, y_train))
         binn_tr_idx, binn_val_idx = binn_inner_splits[0]
 
@@ -409,15 +409,14 @@ class NestedCrossValidator:
         self._training_histories.append(history)
 
         # Save fold network metadata for downstream SHAP analysis.
-        self._fold_network_info[fold_idx] = (
-            {
-                "fold": fold_idx,
-                "connectivity_matrices": [c.detach().cpu() for c in conn_mats],
-                "layer_sizes": list(layer_sizes),
-                "layer_node_names": net["layer_node_names"],
-                "node_metadata": net.get("node_metadata", {}),
-            }
-        )
+        self._fold_network_info[fold_idx] = {
+            "fold": fold_idx,
+            "connectivity_matrices": [c.detach().cpu() for c in conn_mats],
+            "layer_sizes": list(layer_sizes),
+            "layer_node_names": net["layer_node_names"],
+            "node_metadata": net.get("node_metadata", {}),
+            "ppi_overlay": net.get("ppi_overlay", {}),
+        }
 
         # Save model state dict
         model_path = os.path.join(config.MODEL_DIR, f"binn_fold{fold_idx}.pt")

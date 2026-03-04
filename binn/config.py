@@ -87,7 +87,9 @@ FLOAT_DTYPE = "float32"
 
 # ── Cross-Validation ─────────────────────────────────────────────────
 OUTER_FOLDS = 5
-INNER_FOLDS = 3
+INNER_FOLDS = 3       # inner GridSearchCV folds for baseline hyperparameter search
+BINN_VAL_SPLITS = 5   # splits for the BINN train/val split used for early stopping
+                      # (1/BINN_VAL_SPLITS of the outer train fold becomes the val set)
 RANDOM_SEED = 42
 
 # ── Training Hyperparameters ─────────────────────────────────────────
