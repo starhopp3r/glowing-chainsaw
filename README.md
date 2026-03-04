@@ -1,6 +1,4 @@
-# BINN HPV Pipeline
-
-End-to-end pipeline for HPV status prediction using a Biologically Informed Neural Network (BINN), baselines, SHAP interpretation, and publication-style figures.
+# Glowing Chainsaw
 
 ## Project layout
 

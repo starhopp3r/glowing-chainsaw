@@ -14,6 +14,11 @@ import sys
 import warnings
 from typing import Any
 
+# Some notebook runtimes export MPLBACKEND=module://matplotlib_inline.backend_inline.
+# In non-notebook/headless jobs this backend may be unavailable, which breaks import.
+if os.environ.get("MPLBACKEND", "").strip() == "module://matplotlib_inline.backend_inline":
+    os.environ["MPLBACKEND"] = "Agg"
+
 import matplotlib as mpl
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
