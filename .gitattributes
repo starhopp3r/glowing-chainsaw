@@ -1,0 +1,4 @@
+binn/data/string/*.txt filter=lfs diff=lfs merge=lfs -text
+binn/data/string/*.tsv filter=lfs diff=lfs merge=lfs -text
+binn/data/reactome/*.txt filter=lfs diff=lfs merge=lfs -text
+binn/data/raw/*.gz filter=lfs diff=lfs merge=lfs -text
