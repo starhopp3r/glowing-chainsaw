@@ -19,7 +19,10 @@ from typing import Any
 if os.environ.get("MPLBACKEND", "").strip() == "module://matplotlib_inline.backend_inline":
     os.environ["MPLBACKEND"] = "Agg"
 
+import heapq
+
 import matplotlib as mpl
+import matplotlib.collections as mcollections
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -155,51 +158,62 @@ def _resolve_node_overlaps(
     """
     Iteratively separate circular nodes until they no longer overlap.
     Bounds are `(x_min, x_max, y_min, y_max)` in the same coordinate system.
+
+    Uses vectorised NumPy operations — all n*(n-1)/2 pairs are processed in a
+    single matrix operation per iteration, making it fast even for n ~ 500.
     """
     if len(pos) <= 1:
         return dict(pos)
 
     nodes = list(pos.keys())
-    arr = np.array([pos[n] for n in nodes], dtype=float)
+    n = len(nodes)
+    arr = np.array([pos[nd] for nd in nodes], dtype=float)
     anchor = arr.copy()
-    rad = np.array([max(float(radii.get(n, 0.0)), 1e-9) for n in nodes], dtype=float)
+    rad = np.array([max(float(radii.get(nd, 0.0)), 1e-9) for nd in nodes], dtype=float)
 
     x_min, x_max, y_min, y_max = bounds
+    # Pre-computed min-distance matrix and upper-triangle mask (avoid redundant work).
+    min_dist_mat = rad[:, None] + rad[None, :] + gap   # (n, n)
+    triu = np.triu(np.ones((n, n), dtype=bool), k=1)
+
     for _ in range(max(iterations, 1)):
-        total_push = 0.0
-        for i in range(len(nodes)):
-            for j in range(i + 1, len(nodes)):
-                dx = arr[j, 0] - arr[i, 0]
-                dy = arr[j, 1] - arr[i, 1]
-                dist = float(np.hypot(dx, dy))
-                min_dist = float(rad[i] + rad[j] + gap)
-                if dist >= min_dist:
-                    continue
-                if dist < 1e-9:
-                    theta = ((i * 137 + j * 91) % 360) * np.pi / 180.0
-                    ux, uy = float(np.cos(theta)), float(np.sin(theta))
-                else:
-                    ux, uy = dx / dist, dy / dist
-                shift = 0.5 * (min_dist - dist)
-                arr[i, 0] -= ux * shift
-                arr[i, 1] -= uy * shift
-                arr[j, 0] += ux * shift
-                arr[j, 1] += uy * shift
-                total_push += shift
+        # All pairwise displacement vectors: diff[i,j] = arr[j] - arr[i]
+        diff = arr[None, :, :] - arr[:, None, :]        # (n, n, 2)
+        dist = np.hypot(diff[:, :, 0], diff[:, :, 1])  # (n, n)
 
-        # Keep close to original layout while preserving separation.
-        arr += (anchor - arr) * anchor_strength
-
-        # Clamp inside bounds while respecting node radius.
-        for k in range(len(nodes)):
-            rk = rad[k]
-            arr[k, 0] = float(np.clip(arr[k, 0], x_min + rk, x_max - rk))
-            arr[k, 1] = float(np.clip(arr[k, 1], y_min + rk, y_max - rk))
-
-        if total_push < 1e-8:
+        overlap = triu & (dist < min_dist_mat)
+        if not overlap.any():
             break
 
-    return {n: (float(arr[i, 0]), float(arr[i, 1])) for i, n in enumerate(nodes)}
+        i_idx, j_idx = np.where(overlap)
+        dij = dist[i_idx, j_idx]
+
+        # Unit vectors from i toward j (handle coincident nodes with a pseudo-random angle)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ux = diff[i_idx, j_idx, 0] / dij
+            uy = diff[i_idx, j_idx, 1] / dij
+        zero = dij < 1e-9
+        if zero.any():
+            theta = ((i_idx[zero] * 137 + j_idx[zero] * 91) % 360) * (np.pi / 180.0)
+            ux[zero] = np.cos(theta)
+            uy[zero] = np.sin(theta)
+
+        shift = 0.5 * (min_dist_mat[i_idx, j_idx] - dij)  # always positive
+
+        # Push i away from j and j away from i (unbuffered scatter-add)
+        np.subtract.at(arr[:, 0], i_idx, ux * shift)
+        np.subtract.at(arr[:, 1], i_idx, uy * shift)
+        np.add.at(arr[:, 0], j_idx, ux * shift)
+        np.add.at(arr[:, 1], j_idx, uy * shift)
+
+        # Drift back toward anchor positions to preserve the original layout.
+        arr += (anchor - arr) * anchor_strength
+
+        # Clamp inside bounds (per-node radius, vectorised).
+        arr[:, 0] = np.clip(arr[:, 0], x_min + rad, x_max - rad)
+        arr[:, 1] = np.clip(arr[:, 1], y_min + rad, y_max - rad)
+
+    return {nd: (float(arr[i, 0]), float(arr[i, 1])) for i, nd in enumerate(nodes)}
 
 
 def _count_node_overlaps(
@@ -208,19 +222,17 @@ def _count_node_overlaps(
     *,
     gap: float = 0.0,
 ) -> int:
-    """Return number of overlapping node pairs."""
+    """Return number of overlapping node pairs (vectorised)."""
     nodes = list(pos.keys())
-    n_overlaps = 0
-    for i in range(len(nodes)):
-        for j in range(i + 1, len(nodes)):
-            ni, nj = nodes[i], nodes[j]
-            xi, yi = pos[ni]
-            xj, yj = pos[nj]
-            d = float(np.hypot(xj - xi, yj - yi))
-            min_d = float(radii.get(ni, 0.0) + radii.get(nj, 0.0) + gap)
-            if d < min_d:
-                n_overlaps += 1
-    return n_overlaps
+    if len(nodes) <= 1:
+        return 0
+    arr = np.array([pos[nd] for nd in nodes], dtype=float)
+    rad = np.array([float(radii.get(nd, 0.0)) for nd in nodes], dtype=float)
+    diff = arr[:, None, :] - arr[None, :, :]
+    dist = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    min_dist = rad[:, None] + rad[None, :] + gap
+    triu = np.triu(np.ones((len(nodes), len(nodes)), dtype=bool), k=1)
+    return int((triu & (dist < min_dist)).sum())
 
 
 def _resolve_ppi_schema(
@@ -466,12 +478,11 @@ def plot_confusion_matrices(
 
     for ax, mname in zip(axes, models):
         mets = _fold_metrics_for(all_fold_metrics, mname)
-        cm_total = np.zeros((2, 2), dtype=float)
-        for m in mets:
-            cm_total += np.array(m["confusion_matrix"], dtype=float)
-        acc  = np.mean([m["accuracy"]    for m in mets])
-        sens = np.mean([m["recall"]      for m in mets])
-        spec = np.mean([m["specificity"] for m in mets])
+        cms = np.array([m["confusion_matrix"] for m in mets], dtype=float)
+        cm_total = cms.sum(axis=0)
+        metric_arr = np.array([[m["accuracy"], m["recall"], m["specificity"]]
+                                for m in mets], dtype=float)
+        acc, sens, spec = metric_arr.mean(axis=0)
         _draw_cm(ax, cm_total, _disp(mname), acc, sens, spec)
 
     fig.suptitle("Confusion Matrices (Summed Across Folds)", fontsize=13, y=1.02)
@@ -701,20 +712,32 @@ def plot_ppi_importance(
     df = ppi_df.sort_values(imp_col, ascending=False).head(top_n)
     has_gene_shap = s1_col is not None and s2_col is not None
 
-    G = nx.Graph()
-    for _, row in df.iterrows():
-        g1, g2 = row[g1_col], row[g2_col]
-        edge_w = _safe_num(row.get(imp_col), 0.0)
-        s1 = _safe_num(row.get(s1_col), edge_w / 2.0) if has_gene_shap else edge_w / 2.0
-        s2 = _safe_num(row.get(s2_col), edge_w / 2.0) if has_gene_shap else edge_w / 2.0
+    # Vectorised graph construction: no row-level Python loop.
+    g1s = df[g1_col].astype(str)
+    g2s = df[g2_col].astype(str)
+    ws  = pd.to_numeric(df[imp_col], errors="coerce").fillna(0.0)
+    if has_gene_shap:
+        s1s = pd.to_numeric(df[s1_col], errors="coerce").fillna(0.0)
+        s2s = pd.to_numeric(df[s2_col], errors="coerce").fillna(0.0)
+    else:
+        s1s = ws / 2.0
+        s2s = ws / 2.0
 
-        if g1 not in G:
-            G.add_node(g1, shap=0.0)
-        if g2 not in G:
-            G.add_node(g2, shap=0.0)
-        G.nodes[g1]["shap"] = max(_safe_num(G.nodes[g1].get("shap"), 0.0), s1)
-        G.nodes[g2]["shap"] = max(_safe_num(G.nodes[g2].get("shap"), 0.0), s2)
-        G.add_edge(g1, g2, weight=edge_w)
+    # Node SHAP: take max contribution seen across all edges per gene.
+    node_shap: dict[str, float] = {}
+    for gene_ser, shap_ser in ((g1s, s1s), (g2s, s2s)):
+        for gene, val in zip(gene_ser, shap_ser):
+            if val > node_shap.get(gene, 0.0):
+                node_shap[gene] = float(val)
+
+    G = nx.Graph()
+    G.add_nodes_from(node_shap)
+    nx.set_node_attributes(G, node_shap, "shap")
+    G.add_edges_from(
+        (a, b, {"weight": float(w)})
+        for a, b, w in zip(g1s, g2s, ws)
+        if float(w) > 0
+    )
 
     if G.number_of_nodes() == 0:
         return
@@ -738,7 +761,7 @@ def plot_ppi_importance(
         radii,
         bounds=(0.03, 0.97, 0.05, 0.95),
         gap=0.004,
-        iterations=700,
+        iterations=200,
         anchor_strength=0.03,
     )
 
@@ -822,32 +845,50 @@ def plot_full_ppi_map(
         log.warning("%s — skipping full PPI map.", exc)
         return
 
+    g1s = ppi_df[g1_col].astype(str)
+    g2s = ppi_df[g2_col].astype(str)
+    ws  = pd.to_numeric(ppi_df[imp_col], errors="coerce").fillna(0.0)
+    mask = (g1s != "") & (g2s != "") & (g1s != g2s) & (ws > 0)
+    g1f, g2f, wsf = g1s[mask].reset_index(drop=True), g2s[mask].reset_index(drop=True), ws[mask].reset_index(drop=True)
+    if s1_col:
+        s1f = pd.to_numeric(ppi_df[s1_col], errors="coerce").fillna(0.0)[mask].reset_index(drop=True)
+        s2f = pd.to_numeric(ppi_df[s2_col], errors="coerce").fillna(0.0)[mask].reset_index(drop=True)
+    else:
+        s1f = wsf / 2.0
+        s2f = wsf / 2.0
+
+    node_shap: dict[str, float] = {}
+    for gene_ser, shap_ser in ((g1f, s1f), (g2f, s2f)):
+        for gene, val in zip(gene_ser, shap_ser):
+            if val > node_shap.get(gene, 0.0):
+                node_shap[gene] = float(val)
+
+    # Canonical edge direction (alphabetical) for deduplication; keep max weight.
+    edf = pd.DataFrame({"a": g1f.values, "b": g2f.values, "w": wsf.values})
+    edf["p1"] = edf[["a", "b"]].min(axis=1)
+    edf["p2"] = edf[["a", "b"]].max(axis=1)
+    edge_max = edf.groupby(["p1", "p2"])["w"].max()
+
     G = nx.Graph()
-    for row in ppi_df.itertuples(index=False):
-        ra = getattr(row, g1_col)
-        rb = getattr(row, g2_col)
-        ga, gb = str(ra), str(rb)
-        if not ga or not gb or ga == gb:
-            continue
-        w = _safe_num(getattr(row, imp_col), 0.0)
-        if w <= 0:
-            continue
-        sa = _safe_num(getattr(row, s1_col), w / 2.0) if s1_col else w / 2.0
-        sb = _safe_num(getattr(row, s2_col), w / 2.0) if s2_col else w / 2.0
-        if ga not in G:
-            G.add_node(ga, shap=0.0)
-        if gb not in G:
-            G.add_node(gb, shap=0.0)
-        G.nodes[ga]["shap"] = max(_safe_num(G.nodes[ga].get("shap"), 0.0), sa)
-        G.nodes[gb]["shap"] = max(_safe_num(G.nodes[gb].get("shap"), 0.0), sb)
-        if G.has_edge(ga, gb):
-            G[ga][gb]["weight"] = max(_safe_num(G[ga][gb].get("weight"), 0.0), w)
-        else:
-            G.add_edge(ga, gb, weight=w)
+    G.add_nodes_from(node_shap.keys())
+    nx.set_node_attributes(G, node_shap, "shap")
+    G.add_edges_from(
+        (a, b, {"weight": float(w)}) for (a, b), w in edge_max.items()
+    )
 
     if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         log.warning("No valid PPI edges available — skipping full PPI map.")
         return
+
+    # Cap to top-120 nodes by SHAP; beyond this, labels overlap and the
+    # layout becomes unreadable regardless of how long we run.
+    MAX_NODES = 120
+    if G.number_of_nodes() > MAX_NODES:
+        top_nodes = sorted(
+            G.nodes(), key=lambda nd: G.nodes[nd].get("shap", 0.0), reverse=True
+        )[:MAX_NODES]
+        G = G.subgraph(top_nodes).copy()
+        log.info("Full PPI map: retained top-%d nodes by SHAP importance.", MAX_NODES)
 
     n_nodes = G.number_of_nodes()
     try:
@@ -855,12 +896,12 @@ def plot_full_ppi_map(
         base_pos = nx.spring_layout(
             G,
             seed=42,
-            iterations=450 if n_nodes <= 500 else 250,
+            iterations=150,
             k=k,
             weight="weight",
         )
     except Exception:
-        base_pos = {n: (np.cos(i), np.sin(i)) for i, n in enumerate(G.nodes())}
+        base_pos = {nd: (np.cos(i), np.sin(i)) for i, nd in enumerate(G.nodes())}
     pos = _normalise_pos(base_pos, pad=0.08)
 
     node_list = list(G.nodes())
@@ -876,21 +917,21 @@ def plot_full_ppi_map(
         radii,
         bounds=(0.02, 0.98, 0.04, 0.96),
         gap=max(0.001, base_r * 0.20),
-        iterations=900 if n_nodes <= 350 else 500,
+        iterations=200,
         anchor_strength=0.02,
     )
 
     # If any residual overlaps remain, shrink radii slightly and re-resolve.
     overlap_gap = max(0.0008, base_r * 0.15)
     retry = 0
-    while _count_node_overlaps(pos, radii, gap=overlap_gap) > 0 and retry < 5:
+    while _count_node_overlaps(pos, radii, gap=overlap_gap) > 0 and retry < 3:
         radii = {k: v * 0.92 for k, v in radii.items()}
         pos = _resolve_node_overlaps(
             pos,
             radii,
             bounds=(0.02, 0.98, 0.04, 0.96),
             gap=overlap_gap,
-            iterations=500,
+            iterations=150,
             anchor_strength=0.02,
         )
         retry += 1
@@ -902,32 +943,21 @@ def plot_full_ppi_map(
     edges = list(G.edges(data=True))
     ew = np.array([_safe_num(d.get("weight"), 0.0) for _, _, d in edges], dtype=float)
     ew_norm = (ew - ew.min()) / (ew.max() - ew.min() + 1e-9)
-    for (u, v, d), en in zip(edges, ew_norm):
-        x0, y0 = pos[u]
-        x1, y1 = pos[v]
-        ax.plot(
-            [x0, x1], [y0, y1],
-            color="#546E7A",
-            linewidth=0.18 + 1.75 * float(en),
-            alpha=0.10 + 0.30 * float(en),
-            zorder=1,
-        )
+    segs = [[(pos[u][0], pos[u][1]), (pos[v][0], pos[v][1])] for u, v, _ in edges]
+    lws  = 0.18 + 1.75 * ew_norm
+    alphas = 0.10 + 0.30 * ew_norm
+    edge_rgb = np.array([0x54 / 255, 0x6E / 255, 0x7A / 255])
+    edge_rgba = np.column_stack([np.tile(edge_rgb, (len(edges), 1)), alphas])
+    lc = mcollections.LineCollection(segs, linewidths=lws, colors=edge_rgba, zorder=1)
+    ax.add_collection(lc)
 
     cvals = SHAP_CMAP((shap_vals - shap_vals.min()) / (shap_vals.max() - shap_vals.min() + 1e-9))
-    for i, n in enumerate(node_list):
-        x, y = pos[n]
-        r = radii[n]
-        ax.add_patch(
-            mpatches.Circle(
-                (x, y),
-                r,
-                facecolor=cvals[i],
-                edgecolor="#1f2937",
-                linewidth=0.35,
-                alpha=0.95,
-                zorder=3,
-            )
-        )
+    circles = [mpatches.Circle(pos[n], radii[n]) for n in node_list]
+    pc = mcollections.PatchCollection(
+        circles, facecolors=cvals, edgecolors="#1f2937",
+        linewidths=0.35, alpha=0.95, zorder=3,
+    )
+    ax.add_collection(pc)
 
     # Label only top contributors to preserve readability.
     top_label_n = min(60, n_nodes)
@@ -1040,12 +1070,12 @@ def plot_biological_cascade(
     leaf_info  = {p["id"]: p for p in top_leaf}
     gene_names = {g["gene"] for g in top_genes}
 
-    gene_to_leaves: dict[str, list[str]] = {}
+    _g2l_sets: dict[str, set[str]] = {}
     for u, v, _w in cascade_edges:
         u, v = str(u), str(v)
         if u in gene_names and v in leaf_ids:
-            if v not in gene_to_leaves.setdefault(u, []):
-                gene_to_leaves[u].append(v)
+            _g2l_sets.setdefault(u, set()).add(v)
+    gene_to_leaves: dict[str, set[str]] = _g2l_sets
 
     pathway_to_genes: dict[str, list[str]] = {}
     for gene, pids in gene_to_leaves.items():
@@ -1065,23 +1095,22 @@ def plot_biological_cascade(
              if c in ppi_df.columns),
             None,
         )
-        for _, row in ppi_df.iterrows():
-            ga = str(row.get(ga_col, ""))
-            gb = str(row.get(gb_col, ""))
-            if ga not in gene_names or gb not in gene_names:
-                continue
-            imp = _safe_num(row.get(imp_col), 0.0) if imp_col else 0.0
+        _ppi_mask = ppi_df[ga_col].isin(gene_names) & ppi_df[gb_col].isin(gene_names)
+        for row in ppi_df[_ppi_mask].itertuples(index=False):
+            ga = str(getattr(row, ga_col))
+            gb = str(getattr(row, gb_col))
+            imp = _safe_num(getattr(row, imp_col), 0.0) if imp_col else 0.0
             if imp <= 0:
                 continue
-            la = set(gene_to_leaves.get(ga, [])) & leaf_ids
-            lb = set(gene_to_leaves.get(gb, [])) & leaf_ids
+            la = gene_to_leaves.get(ga, set()) & leaf_ids
+            lb = gene_to_leaves.get(gb, set()) & leaf_ids
             for pid in la & lb:
                 ppi_within.setdefault(pid, []).append((ga, gb, imp))
             for pa in sorted(la - lb):
                 for pb in sorted(lb - la):
                     cross_ppi_raw.append((ga, gb, pa, pb, imp))
 
-    cross_ppi = sorted(cross_ppi_raw, key=lambda e: e[4], reverse=True)[:n_cross]
+    cross_ppi = heapq.nlargest(n_cross, cross_ppi_raw, key=lambda e: e[4])
 
     # ── Hierarchy nodes (mix inter + root, top-N by attribution) ─────────────
     all_hier = [
@@ -1193,11 +1222,14 @@ def plot_biological_cascade(
     # Draw in z-order
     # ═══════════════════════════════════════════════════════════════════════════
 
+    # Pre-compute per-gene SHAP color once (reused across multiple draw steps).
+    gene_colors: dict[str, tuple] = {g: _gcol(g) for g in gene_pos}
+
     # ── 1. Gene → pathway connection lines ───────────────────────────────────
     for gene, (gcx, gcy) in gene_pos.items():
         sv = shap_signed.get(gene, 0.0)
         lw = 0.8 + 2.2 * (abs(sv) / shap_max)
-        ec = _gcol(gene)
+        ec = gene_colors[gene]
         for pid in gene_to_leaves.get(gene, []):
             if pid not in box_pos:
                 continue
@@ -1309,7 +1341,7 @@ def plot_biological_cascade(
     for (pid, gene), (px, py) in protein_pos.items():
         ax.add_patch(mpatches.Circle(
             (px, py), PROT_R,
-            facecolor=_gcol(gene), edgecolor="#475569", linewidth=0.8, zorder=7,
+            facecolor=gene_colors.get(gene, _gcol(gene)), edgecolor="#475569", linewidth=0.8, zorder=7,
         ))
 
     # ── 8. Protein labels ─────────────────────────────────────────────────────
@@ -1344,7 +1376,7 @@ def plot_biological_cascade(
         ax.add_patch(mpatches.FancyBboxPatch(
             (gcx - GENE_W / 2, gcy - GENE_H / 2), GENE_W, GENE_H,
             boxstyle="round,pad=0.012",
-            facecolor=_gcol(gene), edgecolor="#1E293B",
+            facecolor=gene_colors[gene], edgecolor="#1E293B",
             linewidth=1.2, zorder=11,
         ))
 
